@@ -21,6 +21,7 @@ export {
   musicbrainzGetArtistIdentityByMbid,
   musicbrainzGetCachedArtistMbidByName,
   musicbrainzResolveArtistMbidByName,
+  musicbrainzGetRecordingsByIds,
 } from "./musicbrainz.js";
 
 export { lastfmRequest, lastfmGetSession, lastfmScrobble } from "./lastfm.js";
