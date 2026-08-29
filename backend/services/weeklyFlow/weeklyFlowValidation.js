@@ -1,4 +1,5 @@
 import { getLastfmApiKey } from "../apiClients/index.js";
+import { isListenbrainzFlowsEnabled } from "../listenbrainzDiscoveryFallback.js";
 
 export function normalizeFlowMixForValidation(mix) {
   const source =
@@ -13,6 +14,7 @@ export function normalizeFlowMixForValidation(mix) {
 
 export function getUnavailableFlowSourceError(mix) {
   if (getLastfmApiKey()) return null;
+  if (isListenbrainzFlowsEnabled()) return null;
   const normalizedMix = normalizeFlowMixForValidation(mix);
   if (normalizedMix.discover > 0) return "Discover flow source requires Last.fm";
   if (normalizedMix.trending > 0) return "Trending flow source requires Last.fm";
