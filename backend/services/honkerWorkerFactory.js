@@ -14,6 +14,7 @@ export default function createHonkerWorker({
   processJob,
   idlePollS,
   retryDelayS = 300,
+  concurrency = 1,
   shouldRestart,
   onStart,
   filterJob,
@@ -24,10 +25,11 @@ export default function createHonkerWorker({
   onFinalFailure,
   onLoopError,
 }) {
+  const loops = [];
   let running = false;
   let stopRequested = false;
-  let idleController = null;
-  let loopPromise = null;
+  let stopResolve = null;
+  let stopPromise = null;
 
   async function handleJobFailure(error, job, queue) {
     const message = error?.message || String(error);
@@ -66,20 +68,40 @@ export default function createHonkerWorker({
     }
   }
 
-  async function runLoop() {
+  function restartAllowed() {
+    return typeof shouldRestart === "function" ? shouldRestart() : true;
+  }
+
+  function respawnLoop() {
+    if (!running || stopRequested || isHonkerShuttingDown()) return;
+    const timer = setTimeout(() => {
+      if (!running || stopRequested || isHonkerShuttingDown()) return;
+      spawnLoop();
+    }, 1000);
+    if (typeof timer.unref === "function") timer.unref();
+  }
+
+  function spawnLoop() {
     const queue = getQueue();
     const workerId = getWorkerId();
-    idleController = createIdleAbortController({
+    const idleController = createIdleAbortController({
       idleStopMs: getWorkerIdleStopMs(),
     });
     idleController.arm();
+    const loop = { idleController, alive: true, promise: null };
+    loops.push(loop);
+    loop.promise = runLoop(loop, queue, workerId, idleController);
+    return loop;
+  }
+
+  async function runLoop(loop, queue, workerId, idleController) {
     try {
       for await (const job of queue.claim(workerId, {
         idlePollS,
         signal: idleController.signal,
       })) {
         idleController.disarm();
-        if (!running || stopRequested) break;
+        if (stopRequested) break;
         if (typeof filterJob === "function" && filterJob(job) === false) {
           job.ack();
           idleController.arm();
@@ -106,18 +128,29 @@ export default function createHonkerWorker({
         console.error(`[${name}] loop error:`, error);
       }
     } finally {
-      const idleStopped = idleController?.idleStopped === true;
       idleController?.dispose();
-      idleController = null;
-      running = false;
-      loopPromise = null;
+      loop.alive = false;
+      loop.idleController = null;
+      loop.promise = null;
+      const stillRunning = loops.some((candidate) => candidate.alive);
+      const idleStopped = idleController?.idleStopped === true;
       const intentional = stopRequested || idleStopped;
-      stopRequested = false;
-      const restartAllowed = typeof shouldRestart === "function" ? shouldRestart() : true;
-      markHonkerWorkerLoopEnded(name, restartAllowed ? start : null, {
-        intentional,
-        ...(typeof shouldRestart === "function" ? { shouldRestart } : {}),
-      });
+      if (!stillRunning) {
+        running = false;
+        stopRequested = false;
+        if (stopResolve) {
+          const resolve = stopResolve;
+          stopResolve = null;
+          stopPromise = null;
+          resolve();
+        }
+        markHonkerWorkerLoopEnded(name, restartAllowed() ? start : null, {
+          intentional,
+          ...(typeof shouldRestart === "function" ? { shouldRestart } : {}),
+        });
+      } else if (!intentional) {
+        respawnLoop();
+      }
     }
   }
 
@@ -126,14 +159,28 @@ export default function createHonkerWorker({
     if (typeof onStart === "function" && onStart() === false) return;
     running = true;
     stopRequested = false;
-    loopPromise = runLoop();
-    return loopPromise;
+    const resolvedConcurrency =
+      typeof concurrency === "function" ? concurrency() : concurrency;
+    const concurrencyCount = Math.max(
+      1,
+      Math.floor(Number(resolvedConcurrency) || 1),
+    );
+    for (let index = 0; index < concurrencyCount; index += 1) {
+      spawnLoop();
+    }
   }
 
   function stop() {
+    if (!running) return Promise.resolve();
+    if (stopPromise) return stopPromise;
     stopRequested = true;
-    idleController?.abort();
-    return loopPromise || Promise.resolve();
+    for (const loop of loops) {
+      loop.idleController?.abort();
+    }
+    stopPromise = new Promise((resolve) => {
+      stopResolve = resolve;
+    });
+    return stopPromise;
   }
 
   function isRunning() {

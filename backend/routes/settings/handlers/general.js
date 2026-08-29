@@ -100,6 +100,7 @@ export function registerGeneral(router) {
         pathMappings,
         security,
         playlistArtwork,
+        pipeline,
         inbox,
         dateTimeFormat,
       } = req.body;
@@ -486,6 +487,15 @@ export function registerGeneral(router) {
               }
             : currentSettings.playlistArtwork ||
               defaultData.settings.playlistArtwork,
+        pipeline:
+          pipeline !== undefined
+            ? {
+                ...(currentSettings.pipeline ||
+                  defaultData.settings.pipeline),
+                ...pipeline,
+              }
+            : currentSettings.pipeline ||
+              defaultData.settings.pipeline,
       };
 
       if (updatedSettings?.integrations?.coverArtArchive) {
@@ -536,6 +546,19 @@ export function registerGeneral(router) {
           });
         }
         playlistManager.scheduleScanLibrary(true);
+      }
+      if (pipeline?.concurrency !== undefined) {
+        const {
+          isSlskdOrchestratorRunning,
+          stopSlskdOrchestratorWorker,
+          startSlskdOrchestratorWorker,
+        } = await import(
+          "../../../services/slskdOrchestratorWorker.js"
+        );
+        if (isSlskdOrchestratorRunning()) {
+          await stopSlskdOrchestratorWorker();
+          startSlskdOrchestratorWorker();
+        }
       }
       const reconciled = reconcileLocalNetworkBypassSetting().settings;
       if (

@@ -7,6 +7,7 @@ import DownloadFolderField from "../../../components/DownloadFolderField";
 import { IntegrationCard, SettingsIntegrationModal } from "./SettingsIntegrationCards";
 import { SettingsAdapterFields } from "./SettingsAdapterFields";
 import { SettingsArrFieldSet, SettingsArrFormGroup } from "./arr/SettingsArrLayout";
+import { SettingsInput } from "./SettingsField";
 import { getProviderStatus } from "../utils/integrationStatus";
 import { PATH_MAPPING_SOURCE_OPTIONS, PathMappingModal } from "./PathMappingModal";
 import { QUALITY_TIER_LABELS, QualityProfileModal } from "./QualityProfileModal";
@@ -119,6 +120,20 @@ export function SettingsDownloadClientsSection({
     updateSettings({
       ...settings,
       qualityProfile: { ...qualityProfile, ...patch },
+    });
+  };
+
+  const updatePipelineConcurrency = (value) => {
+    const raw = Number(value);
+    const concurrency = Number.isFinite(raw)
+      ? Math.max(1, Math.min(16, Math.floor(raw)))
+      : 4;
+    updateSettings({
+      ...settings,
+      pipeline: {
+        ...(settings.pipeline || {}),
+        concurrency,
+      },
     });
   };
 
@@ -259,6 +274,24 @@ export function SettingsDownloadClientsSection({
                 downloadFolderPath: nextPath,
               })
             }
+          />
+        </SettingsArrFormGroup>
+      </SettingsArrFieldSet>
+
+      <SettingsArrFieldSet legend="Download pipeline">
+        <SettingsArrFormGroup
+          label="Concurrent tracks"
+          labelFor="download-pipeline-concurrency"
+          help="How many tracks the download pipeline processes in parallel (1-16). Higher clears large queues faster but each active search uses a download-client connection."
+        >
+          <SettingsInput
+            id="download-pipeline-concurrency"
+            type="number"
+            min={1}
+            max={16}
+            step={1}
+            value={settings.pipeline?.concurrency ?? 4}
+            onChange={(e) => updatePipelineConcurrency(e.target.value)}
           />
         </SettingsArrFormGroup>
       </SettingsArrFieldSet>

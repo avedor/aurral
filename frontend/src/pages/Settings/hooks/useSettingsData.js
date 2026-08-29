@@ -197,6 +197,9 @@ const defaultSettings = {
       enabled: false,
     },
   },
+  pipeline: {
+    concurrency: 4,
+  },
 };
 
 const AUTOSAVE_DELAY_MS = 450;

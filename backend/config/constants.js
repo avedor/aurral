@@ -172,5 +172,8 @@ export const defaultData = {
       recommendedNews: false,
       discoveries: true,
     },
+    pipeline: {
+      concurrency: 4,
+    },
   },
 };
