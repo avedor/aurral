@@ -64,6 +64,23 @@ function normalizePlaylistWorkerSettings(raw) {
   };
 }
 
+const PIPELINE_CONCURRENCY_DEFAULT = 4;
+const PIPELINE_CONCURRENCY_MAX = 16;
+
+function normalizePipelineSettings(raw) {
+  const pipeline = raw && typeof raw === "object" ? raw : {};
+  const parsedConcurrency = Number(pipeline.concurrency);
+  if (!Number.isFinite(parsedConcurrency)) {
+    return { concurrency: PIPELINE_CONCURRENCY_DEFAULT };
+  }
+  return {
+    concurrency: Math.max(
+      1,
+      Math.min(PIPELINE_CONCURRENCY_MAX, Math.floor(parsedConcurrency)),
+    ),
+  };
+}
+
 function getOrCreateEncryptionKey() {
   const row = getSettingStmt.get("_encryptionKey");
   if (row?.value) {
@@ -138,6 +155,9 @@ export const dbOps = {
     const playlistArtwork = normalizePlaylistArtworkSettings(
       readStoredSettingJson("playlistArtwork"),
     );
+    const pipeline = normalizePipelineSettings(
+      readStoredSettingJson("pipeline"),
+    );
     const inbox = dbHelpers.parseJSON(getSettingStmt.get("inbox")?.value) || {};
     const blocklist = dbHelpers.parseJSON(
       getSettingStmt.get("blocklist")?.value
@@ -180,6 +200,7 @@ export const dbOps = {
       },
       playlistWorker,
       playlistArtwork,
+      pipeline,
       inbox: {
         enabled: inbox.enabled !== false,
         releases: inbox.releases !== false,
@@ -346,6 +367,12 @@ export const dbOps = {
           dbHelpers.stringifyJSON(
             normalizePlaylistArtworkSettings(settings.playlistArtwork),
           ),
+        );
+      }
+      if (settings.pipeline !== undefined) {
+        upsertSettingStmt.run(
+          "pipeline",
+          dbHelpers.stringifyJSON(normalizePipelineSettings(settings.pipeline)),
         );
       }
       if (settings.blocklist !== undefined) {

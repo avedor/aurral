@@ -87,3 +87,47 @@ test("schedules the library scan after playlist initialization settles", async (
     playlistManager.scheduleScanLibrary = originalScheduleScanLibrary;
   }
 });
+
+test("pipeline concurrency persists and clamps to the allowed range", async () => {
+  const routes = {};
+  registerGeneral({
+    get(path, ...handlers) {
+      routes[`GET ${path}`] = handlers.at(-1);
+    },
+    post(path, ...handlers) {
+      routes[`POST ${path}`] = handlers.at(-1);
+    },
+  });
+
+  const callPost = async (body) => {
+    let statusCode = 200;
+    let responseBody;
+    const response = {
+      status(code) {
+        statusCode = code;
+        return this;
+      },
+      json(bodyValue) {
+        responseBody = bodyValue;
+        return this;
+      },
+    };
+    await routes["POST /"](
+      { body, user: { id: 1 } },
+      response,
+    );
+    return { statusCode, responseBody };
+  };
+
+  const post = await callPost({ pipeline: { concurrency: 7 } });
+  assert.equal(post.statusCode, 200);
+  assert.equal(dbOps.getSettings().pipeline.concurrency, 7);
+
+  const outOfRange = await callPost({ pipeline: { concurrency: 999 } });
+  assert.equal(outOfRange.statusCode, 200);
+  assert.equal(dbOps.getSettings().pipeline.concurrency, 16);
+
+  const negative = await callPost({ pipeline: { concurrency: -3 } });
+  assert.equal(negative.statusCode, 200);
+  assert.equal(dbOps.getSettings().pipeline.concurrency, 1);
+});

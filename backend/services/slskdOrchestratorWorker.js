@@ -7,6 +7,29 @@ import {
   failPipelineJob,
 } from "./slskdOrchestrator.js";
 import { isAnyDownloadSourceConfigured } from "./downloadSourceService.js";
+import { dbOps } from "../db/helpers/settings.js";
+
+const DEFAULT_PIPELINE_CONCURRENCY = 4;
+const PIPELINE_CONCURRENCY_MAX = 16;
+
+function clampConcurrency(value) {
+  return Math.max(
+    1,
+    Math.min(PIPELINE_CONCURRENCY_MAX, Math.floor(Number(value) || 1)),
+  );
+}
+
+function resolvePipelineConcurrency() {
+  const storedPipeline = dbOps.getJSONSetting("pipeline") || {};
+  if (Number.isFinite(Number(storedPipeline.concurrency))) {
+    return clampConcurrency(storedPipeline.concurrency);
+  }
+  const configured = Number(process.env.AURRAL_PIPELINE_CONCURRENCY);
+  if (Number.isFinite(configured) && configured >= 1) {
+    return clampConcurrency(configured);
+  }
+  return DEFAULT_PIPELINE_CONCURRENCY;
+}
 
 const {
   start: startSlskdOrchestratorWorker,
@@ -17,6 +40,7 @@ const {
   getQueue: getPipelineQueue,
   idlePollS: 2,
   retryDelayS: 30,
+  concurrency: () => resolvePipelineConcurrency(),
   shouldRestart: () => isAnyDownloadSourceConfigured(),
   onStart() {
     if (!isAnyDownloadSourceConfigured()) return false;
@@ -45,4 +69,5 @@ export {
   startSlskdOrchestratorWorker,
   stopSlskdOrchestratorWorker,
   isSlskdOrchestratorRunning,
+  resolvePipelineConcurrency,
 };

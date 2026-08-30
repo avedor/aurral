@@ -73,6 +73,12 @@ Use the web UI for most settings. Use these variables for Docker deployment sett
 | -------- | ------- |
 | `AURRAL_LASTFM_TIMEOUT_MS` | Last.fm API timeout in milliseconds. Default `15000`. Increase this value if focus playlists have no tracks and logs show `ECONNABORTED`. |
 
+## Download pipeline tuning
+
+| Variable | Purpose |
+| -------- | ------- |
+| `AURRAL_PIPELINE_CONCURRENCY` | Override the number of tracks the Download Pipeline Worker processes in parallel. Default `4` (max `16`). You can also set this in the web UI under **Settings > Download clients > Download pipeline > Concurrent tracks**, which takes precedence at runtime. Increasing it can clear large download queues faster, but each active search holds a connection to the download client (for example, slskd), so very high values can overload it. Most installs want `2` to `8`. |
+
 ## Spotify playlist import
 
 These variables change the shared Lidarr Spotify OAuth proxy. The default values are correct for most installations.

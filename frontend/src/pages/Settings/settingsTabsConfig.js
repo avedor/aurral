@@ -116,7 +116,7 @@ const SETTINGS_SEARCH_METADATA = {
     },
   },
   "download-clients": {
-    sections: ["Quality profile", "Downloads folder", "Remote path mappings", "Connection", "Behavior", "Downloads", "Advanced"],
+    sections: ["Quality profile", "Downloads folder", "Download pipeline", "Remote path mappings", "Connection", "Behavior", "Downloads", "Advanced"],
     services: {
       slskd: "Soulseek download client",
       "yt-dlp": "YouTube web download client",
@@ -130,6 +130,7 @@ const SETTINGS_SEARCH_METADATA = {
       "Automatic upgrades": "upgrade searches Flow Static tracks",
       "Upgrade interval": "days between checks",
       Path: "downloads folder media library",
+      "Concurrent tracks": "download pipeline parallel worker concurrency speed queue",
       "Applies to": "remote path mapping source client all",
       "Remote path": "download client path mapping",
       "Local path": "Aurral path mapping",
