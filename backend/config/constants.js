@@ -173,7 +173,7 @@ export const defaultData = {
       discoveries: true,
     },
     pipeline: {
-      concurrency: 4,
+      concurrency: 2,
     },
   },
 };
