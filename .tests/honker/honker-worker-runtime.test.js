@@ -386,3 +386,21 @@ test("weekly flow operation queue status reflects worker state and depth", () =>
     currentLabel: null,
   });
 });
+
+test("worker queued count is real even when depth exceeds the display cap", async () => {
+  const queue = honkerDb.getLibraryScanQueue();
+  for (let index = 0; index < 150; index += 1) {
+    queue.enqueue({ kind: `backlog-test-${index}` });
+  }
+
+  const status = await taskStatus.getHonkerTaskStatus();
+  const worker = status.workers.find((entry) => entry.queue === "library-scan");
+  assert.ok(Number(worker?.queued || 0) >= 150, `expected real queued count, got ${worker?.queued}`);
+
+  const liveDisplayRows = status.queue.filter((entry) => entry.source === "live");
+  assert.ok(
+    liveDisplayRows.length <= 100,
+    `display table should be capped at 100, got ${liveDisplayRows.length}`,
+  );
+});
+

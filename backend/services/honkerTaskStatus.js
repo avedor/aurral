@@ -128,7 +128,7 @@ export const HONKER_QUEUE_NAMES = QUEUE_DEFINITIONS.map((definition) => definiti
 
 const RUN_LEDGER_MAX_AGE_MS = 60 * 60 * 1000;
 const STALE_RUNNING_MS = 60 * 60 * 1000;
-const LIVE_JOB_LIMIT = 500;
+const LIVE_JOB_LIMIT = 100;
 const DEAD_JOB_LIMIT = 50;
 
 const queueDefinitionByName = new Map(
@@ -717,6 +717,8 @@ function readLatestRunsByTask() {
 }
 
 function readLiveJobs() {
+  // Display-only cap for the Queue table. Real per-queue depth (Qu/Queued counts)
+  // is computed separately in readQueueStats so it is not limited by this cap.
   return safeQuery(
     `
       SELECT id, queue, payload, state, priority, run_at, worker_id,
@@ -747,8 +749,28 @@ function readDeadJobs() {
   );
 }
 
-function readQueueStats(liveRows = []) {
+function readQueueStats() {
   const currentTime = nowUnix();
+  const depthRows = safeQuery(
+    `
+      SELECT queue,
+             COUNT(*) AS live_count,
+             COALESCE(SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END), 0) AS running_count,
+             COALESCE(SUM(CASE WHEN state = 'pending' AND run_at <= ? THEN 1 ELSE 0 END), 0) AS queued_count
+      FROM _honker_live
+      GROUP BY queue
+    `,
+    [currentTime],
+  );
+  const scheduledRows = safeQuery(
+    `
+      SELECT queue, payload, run_at
+      FROM _honker_live
+      WHERE state = 'pending' AND run_at > ?
+      ORDER BY run_at ASC
+    `,
+    [currentTime],
+  );
   const deadStats = safeQuery(
     `
     SELECT queue, COUNT(*) AS failed_count
@@ -777,8 +799,8 @@ function readQueueStats(liveRows = []) {
       queuedCount: 0,
       scheduledCount: 0,
       scheduledKeys: new Set(),
+      nextRunAtUnix: null,
       failedCount: 0,
-      nextRunAt: null,
       lastRunAt: null,
     });
   }
@@ -792,29 +814,26 @@ function readQueueStats(liveRows = []) {
         queuedCount: 0,
         scheduledCount: 0,
         scheduledKeys: new Set(),
+        nextRunAtUnix: null,
         failedCount: 0,
-        nextRunAt: null,
         lastRunAt: null,
       });
     }
     return stats.get(queue);
   };
 
-  for (const row of liveRows) {
+  for (const row of depthRows) {
     const entry = ensure(row.queue);
-    const state = String(row.state || "pending");
+    entry.liveCount = Number(row.live_count || 0);
+    entry.runningCount = Number(row.running_count || 0);
+    entry.queuedCount = Number(row.queued_count || 0);
+  }
+  for (const row of scheduledRows) {
+    const entry = ensure(row.queue);
+    entry.scheduledKeys.add(taskMatchKey(row.queue, parsePayload(row.payload)));
     const runAt = Number(row.run_at || 0);
-    entry.liveCount += 1;
-    if (state === "processing") {
-      entry.runningCount += 1;
-    } else if (runAt > currentTime) {
-      const payload = parsePayload(row.payload);
-      entry.scheduledKeys.add(taskMatchKey(row.queue, payload));
-      if (!entry.nextRunAt || runAt < Number(Date.parse(entry.nextRunAt) / 1000)) {
-        entry.nextRunAt = unixToIso(runAt);
-      }
-    } else {
-      entry.queuedCount += 1;
+    if (entry.nextRunAtUnix == null || runAt < entry.nextRunAtUnix) {
+      entry.nextRunAtUnix = runAt;
     }
   }
   for (const row of deadStats) {
@@ -827,6 +846,8 @@ function readQueueStats(liveRows = []) {
   for (const entry of stats.values()) {
     entry.scheduledCount = entry.scheduledKeys.size;
     delete entry.scheduledKeys;
+    entry.nextRunAt = entry.nextRunAtUnix != null ? unixToIso(entry.nextRunAtUnix) : null;
+    delete entry.nextRunAtUnix;
   }
 
   return stats;
@@ -1145,7 +1166,7 @@ export async function getHonkerTaskStatus() {
   const deadRows = readDeadJobs();
   const runRows = readRecentRuns();
   const runningStartsByJobId = readRunningStartsByJobId();
-  const queueStats = readQueueStats(liveRows);
+  const queueStats = readQueueStats();
   const workerStatuses = await readWorkerStatuses();
   const workers = normalizeWorkerRows(workerStatuses, queueStats);
   const queue = normalizeQueueRows(liveRows, deadRows, runRows, runningStartsByJobId);
