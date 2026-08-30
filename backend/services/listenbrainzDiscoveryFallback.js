@@ -11,6 +11,16 @@ import { getArtistGenres } from "./providers/brainzmashProvider.js";
 export const DISCOVERY_PROVIDER_LASTFM = "lastfm";
 export const DISCOVERY_PROVIDER_LISTENBRAINZ_FALLBACK = "listenbrainz-fallback";
 
+export const isListenbrainzFlowsEnabled = () => {
+  if (
+    process.env.DISABLE_LISTENBRAINZ_FLOWS === "1" ||
+    process.env.DISABLE_LISTENBRAINZ_FLOWS === "true"
+  ) {
+    return false;
+  }
+  return true;
+};
+
 const LISTENBRAINZ_SITEWIDE_POOL_CACHE = createCache(6 * 60 * 60);
 const LISTENBRAINZ_ENRICHED_POOL_CACHE = createCache(6 * 60 * 60);
 const LISTENBRAINZ_SITEWIDE_POOL_LIMIT = 1000;
@@ -633,15 +643,22 @@ export const getDiscoveryCapabilities = (hasLastfmKey = !!getLastfmApiKey()) => 
 };
 
 export const getFlowCapabilities = (hasLastfmKey = !!getLastfmApiKey()) => {
-  if (hasLastfmKey) {
+  const listenbrainzFlows = isListenbrainzFlowsEnabled();
+  if (hasLastfmKey || listenbrainzFlows) {
     return {
-      lastfmRequired: false,
+      lastfmRequired: !hasLastfmKey && !listenbrainzFlows,
+      listenbrainzBased: !hasLastfmKey && listenbrainzFlows,
+      requiresListeningHistory: true,
+      provider: hasLastfmKey ? "lastfm" : "listenbrainz",
       availableSources: ["discover", "mix", "trending", "focus"],
       unavailableSources: {},
     };
   }
   return {
     lastfmRequired: true,
+    listenbrainzBased: false,
+    requiresListeningHistory: true,
+    provider: "lastfm",
     availableSources: [],
     unavailableSources: {
       discover: "Last.fm API key required",
