@@ -756,7 +756,7 @@ function readQueueStats() {
       SELECT queue,
              COUNT(*) AS live_count,
              COALESCE(SUM(CASE WHEN state = 'processing' THEN 1 ELSE 0 END), 0) AS running_count,
-             COALESCE(SUM(CASE WHEN state = 'pending' AND run_at <= ? THEN 1 ELSE 0 END), 0) AS queued_count
+             (SELECT COUNT(DISTINCT json_extract(sub.payload, '$.jobId')) FROM _honker_live sub WHERE sub.queue = _honker_live.queue AND sub.state = 'pending' AND sub.run_at <= ?) AS queued_count
       FROM _honker_live
       GROUP BY queue
     `,
