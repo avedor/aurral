@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
-import { userOps } from "../../db/helpers/index.js";
 import { NavidromeClient } from "../navidrome.js";
 import { logger } from "../logger.js";
 import { navidromePlaylistPointerStore } from "../navidrome/navidromePlaylistPointerStore.js";
@@ -91,10 +90,9 @@ export class NavidromePlaybackDestination {
     return String(value || "").replace(/[<>:"/\\|?*]/g, "_").trim();
   }
 
-  getPlaylistNames({ entityId, ownerUserId = null, displayName } = {}) {
+  getPlaylistNames({ entityId, displayName } = {}) {
     const name = String(displayName || "").trim();
-    const owner = ownerUserId == null ? null : userOps.getUserById(ownerUserId);
-    const current = owner?.username ? `${owner.username} - ${name}` : name;
+    const current = name;
     const shared = Boolean(flowPlaylistConfig.getSharedPlaylist(entityId));
     const legacy = shared
       ? [name, `[AS] ${name}`, `Aurral Shared ${name}`]
