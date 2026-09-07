@@ -127,7 +127,7 @@ test("ensures the Navidrome library without creating an M3U playlist", async () 
 
   assert.deepEqual(client.calls.ensured, [destination.mediaLibraryRoot.replace(/\\/g, "/")]);
   await assert.rejects(
-    fs.access(path.join(destination.libraryRoot, "Morning Mix.m3u")),
+    fs.access(path.join(destination.libraryRoot, "jody - Morning Mix.m3u")),
   );
 });
 
@@ -161,14 +161,14 @@ test("publishes resolved tracks through the Subsonic API and stores the playlist
   );
 
   assert.deepEqual(client.calls.created, [
-    { name: "API Mix", songIds: ["song-1", "song-2"] },
+    { name: "casey - API Mix", songIds: ["song-1", "song-2"] },
   ]);
   assert.equal(
     navidromePlaylistPointerStore.getPointer(playlist.id, String(owner.id)).playlistId,
     "created",
   );
   await assert.rejects(
-    fs.access(path.join(destination.libraryRoot, "API Mix.m3u")),
+    fs.access(path.join(destination.libraryRoot, "casey - API Mix.m3u")),
   );
 });
 

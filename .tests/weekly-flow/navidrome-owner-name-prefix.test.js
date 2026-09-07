@@ -69,18 +69,22 @@ test("the Navidrome adapter keeps an unowned flow name bare", () => {
   assert.deepEqual(names.legacy, ["[A] Weekend Vibes", "Aurral Weekend Vibes"]);
 });
 
-test("the Navidrome adapter keeps an owned flow name bare and keeps legacy names", () => {
+test("the Navidrome adapter prefixes an owned flow name when enabled", () => {
   const jody = userOps.createUser("jody", "hash", "user");
   const manager = makeManager();
   const names = manager.navidromeDestination.getPlaylistNames({
     ownerUserId: jody.id,
     displayName: "Weekend Vibes",
   });
-  assert.equal(names.current, "Weekend Vibes");
-  assert.deepEqual(names.legacy, ["[A] Weekend Vibes", "Aurral Weekend Vibes"]);
+  assert.equal(names.current, "jody - Weekend Vibes");
+  assert.deepEqual(names.legacy, [
+    "Weekend Vibes",
+    "[A] Weekend Vibes",
+    "Aurral Weekend Vibes",
+  ]);
 });
 
-test("the Navidrome adapter keeps an owned shared playlist name bare and keeps legacy names", () => {
+test("the Navidrome adapter prefixes an owned shared playlist name when enabled", () => {
   const jody = userOps.createUser("jody", "hash", "user");
   const playlist = flowPlaylistConfig.createSharedPlaylist({ name: "80s Anthems" });
   const manager = makeManager();
@@ -89,11 +93,35 @@ test("the Navidrome adapter keeps an owned shared playlist name bare and keeps l
     ownerUserId: jody.id,
     displayName: "80s Anthems",
   });
-  assert.equal(names.current, "80s Anthems");
+  assert.equal(names.current, "jody - 80s Anthems");
   assert.deepEqual(names.legacy, [
+    "80s Anthems",
     "[AS] 80s Anthems",
     "Aurral Shared 80s Anthems",
   ]);
+  flowPlaylistConfig.deleteSharedPlaylist(playlist.id);
+});
+
+test("the Navidrome adapter keeps owned flow names bare when the toggle is off", () => {
+  const jody = userOps.createUser("jody", "hash", "user");
+  const playlist = flowPlaylistConfig.createSharedPlaylist({ name: "80s Anthems" });
+  const manager = makeManager();
+  manager.navidromeDestination.updateConfig({ prefixOwnerUsername: false });
+
+  const flow = manager.navidromeDestination.getPlaylistNames({
+    ownerUserId: jody.id,
+    displayName: "Weekend Vibes",
+  });
+  assert.equal(flow.current, "Weekend Vibes");
+  assert.deepEqual(flow.legacy, ["[A] Weekend Vibes", "Aurral Weekend Vibes"]);
+
+  const shared = manager.navidromeDestination.getPlaylistNames({
+    entityId: playlist.id,
+    ownerUserId: jody.id,
+    displayName: "80s Anthems",
+  });
+  assert.equal(shared.current, "80s Anthems");
+  assert.deepEqual(shared.legacy, ["[AS] 80s Anthems", "Aurral Shared 80s Anthems"]);
   flowPlaylistConfig.deleteSharedPlaylist(playlist.id);
 });
 
@@ -109,6 +137,7 @@ test("two different owners can use the same native playlist name", async () => {
   flowPlaylistConfig.setEnabled(jodyFlow.id, true);
 
   const manager = makeManager();
+  manager.navidromeDestination._prefixOwnerUsername = false;
   await manager.ensurePlaylists();
 
   assert.deepEqual(
