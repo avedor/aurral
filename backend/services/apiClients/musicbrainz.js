@@ -19,6 +19,7 @@ import { runSharedInflight } from "../sharedInflight.js";
 const musicbrainzArtistNameCache = createCache(3600);
 const musicbrainzArtistIdentityCache = createCache(3600);
 const musicbrainzReleaseGroupsCache = createCache(300);
+const musicbrainzRecordingCache = createCache(21600);
 const musicbrainzInflightRequests = new Map();
 const PRIMARY_RELEASE_TYPES = ["Album", "EP", "Single"];
 const SECONDARY_RELEASE_TYPES = [
@@ -36,6 +37,112 @@ const mbLimiter = createRateLimiter(1000);
 
 export const musicbrainzRequest = async (endpoint, params = {}) =>
   legacyMusicbrainzRequest(endpoint, params);
+
+const isValidMbid = (value) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    String(value || "").trim(),
+  );
+
+const parseMusicbrainzRecordingEntity = (recording) => {
+  if (!recording?.id) return null;
+  const artistCredits = Array.isArray(recording["artist-credit"])
+    ? recording["artist-credit"]
+    : [];
+  const artistName = artistCredits
+    .map(
+      (credit) =>
+        `${String(credit?.name || "").trim()}${String(credit?.joinphrase || "").trim()}`,
+    )
+    .join("")
+    .trim();
+  const primaryArtist = artistCredits.find(
+    (credit) => String(credit?.artist?.id || "").trim(),
+  );
+  const releases = Array.isArray(recording.releases) ? recording.releases : [];
+  const primaryRelease = releases[0] || null;
+  const releaseGroup = primaryRelease?.["release-group"] || null;
+  const durationMs = Number.parseInt(recording?.length, 10);
+  return {
+    trackMbid: String(recording.id).trim(),
+    title: String(recording?.title || "").trim(),
+    artistName: artistName || null,
+    artistMbid: String(primaryArtist?.artist?.id || "").trim() || null,
+    durationMs: Number.isFinite(durationMs) && durationMs > 0 ? durationMs : null,
+    releaseName:
+      String(primaryRelease?.title || releaseGroup?.title || "").trim() || null,
+    releaseMbid: String(primaryRelease?.id || "").trim() || null,
+    firstReleaseDate:
+      String(
+        primaryRelease?.date || releaseGroup?.["first-release-date"] || "",
+      ).trim() || null,
+  };
+};
+
+export async function musicbrainzGetRecordingsByIds(mbids, { signal } = {}) {
+  const unique = [
+    ...new Set(
+      (Array.isArray(mbids) ? mbids : [])
+        .map((mbid) => String(mbid || "").trim().toLowerCase())
+        .filter(isValidMbid),
+    ),
+  ];
+  if (unique.length === 0) return [];
+  const resolved = new Map();
+  const missing = [];
+  for (const mbid of unique) {
+    const cached = musicbrainzRecordingCache.get(mbid);
+    if (cached !== undefined) {
+      if (cached) resolved.set(mbid, cached);
+    } else {
+      missing.push(mbid);
+    }
+  }
+  if (missing.length > 0) {
+    const contact =
+      (getMusicBrainzContact() || "").trim() || "https://github.com/aurral";
+    const userAgent = `${APP_NAME}/${APP_VERSION} ( ${contact} )`;
+    for (let offset = 0; offset < missing.length; offset += 20) {
+      const batch = missing.slice(offset, offset + 20);
+      try {
+        const response = await mbLimiter.schedule(async () => {
+          signal?.throwIfAborted?.();
+          return axios.get(
+            `${MUSICBRAINZ_API}/recording/${batch.join(";")}`,
+            {
+              params: { fmt: "json", inc: "artist-credits+releases" },
+              headers: { "User-Agent": userAgent },
+              timeout: 12000,
+              signal,
+            },
+          );
+        });
+        const recordings = Array.isArray(response?.data?.recordings)
+          ? response.data.recordings
+          : [];
+        const byId = new Map(
+          recordings
+            .map((entry) => {
+              const parsed = parseMusicbrainzRecordingEntity(entry);
+              return parsed
+                ? [String(parsed.trackMbid).toLowerCase(), parsed]
+                : null;
+            })
+            .filter(Boolean),
+        );
+        for (const mbid of batch) {
+          const parsed = byId.get(mbid) || null;
+          musicbrainzRecordingCache.set(mbid, parsed);
+          if (parsed) resolved.set(mbid, parsed);
+        }
+      } catch {
+        for (const mbid of batch) {
+          musicbrainzRecordingCache.set(mbid, null);
+        }
+      }
+    }
+  }
+  return unique.map((mbid) => resolved.get(mbid)).filter(Boolean);
+}
 
 export async function musicbrainzGetArtistReleaseGroups(
   mbid,
