@@ -1203,7 +1203,17 @@ export class WeeklyFlowPlaylistSource {
     }
     if (cachedTags?.promise) return cachedTags.promise;
     const promise = (async () => {
-      if (!getLastfmApiKey()) return [];
+      if (!getLastfmApiKey()) {
+        // MusicBrainz genres stand in for Last.fm artist tags so focus-tier tag
+        // coverage still works without a Last.fm key.
+        const { fetchListenbrainzArtistTags } = await import(
+          "../discovery/listenbrainzRecommendations.js"
+        );
+        return (await fetchListenbrainzArtistTags({ name, mbid }).catch(() => [])).slice(
+          0,
+          12,
+        );
+      }
       const params = mbid ? { mbid, limit: 12 } : { artist: name, limit: 12 };
       try {
         const data = await lastfmRequest("artist.getTopTags", params);

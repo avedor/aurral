@@ -403,8 +403,6 @@ const scheduleDiscoverPlaylistBuild = ({
   publishUpdate = true,
   progressExtra = {},
 } = {}) => {
-  if (!getLastfmApiKey()) return;
-
   const buildKey = getDiscoveryPlaylistBuildKey(cacheNamespace);
   const buildToken = randomUUID();
   setDiscoveryPlaylistBuildToken(buildKey, buildToken);

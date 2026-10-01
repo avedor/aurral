@@ -319,3 +319,56 @@ test("hasListenbrainzHistoryProfile detects configured listenbrainz users", () =
   db.prepare("DELETE FROM users").run();
   assert.equal(hasListenbrainzHistoryProfile(), false);
 });
+
+test("editorial playlists build from listenbrainz tags without a lastfm key", async (t) => {
+  const recA = "1a1a1a1a-0001-4a1a-8a1a-1a1a1a1a1a01";
+  const recB = "1b1b1b1b-0002-4b1b-8b1b-1b1b1b1b1b02";
+  const releaseMbid = "1c1c1c1c-0003-4c1c-8c1c-1c1c1c1c1c03";
+
+  mockListenbrainzOnly(t, async (url) => {
+    const target = String(url);
+    if (target.includes("/recording/")) {
+      const requested = target.split("/recording/")[1]?.split("?")[0] || "";
+      const ids = requested.split(";");
+      return {
+        status: 200,
+        data: {
+          recordings: ids.map((id) => ({
+            id,
+            title: id === recA ? "First Track" : "Second Track",
+            "artist-credit": [
+              { name: "Tag Artist", artist: { id: SIMILAR_MBID } },
+            ],
+            releases: [{ id: releaseMbid, title: "Tag Album", date: "2021-05-04" }],
+            length: 210000,
+          })),
+        },
+      };
+    }
+    assert.match(target, /\/1\/lb-radio\/tags/);
+    return {
+      status: 200,
+      data: [
+        { recording_mbid: recA, total_listen_count: 900 },
+        { recording_mbid: recB, total_listen_count: 400 },
+      ],
+    };
+  });
+
+  const { generateEditorialPlaylists } = await importFromRepo(
+    "backend/services/discovery/editorialPlaylistBuilder.js",
+  );
+  const playlists = await generateEditorialPlaylists();
+
+  assert.ok(playlists.length > 0, "expected editorial playlists without a lastfm key");
+  const playlist = playlists[0];
+  assert.equal(playlist.type, "editorial");
+  assert.equal(playlist.trackCount, playlist.tracks.length);
+  assert.ok(playlist.tracks.length > 0);
+  assert.equal(playlist.tracks[0].artistName, "Tag Artist");
+  assert.equal(playlist.tracks[0].trackName, "First Track");
+  // Album names come from MusicBrainz metadata, not a Last.fm track.getInfo call.
+  assert.equal(playlist.tracks[0].albumName, "Tag Album");
+  // Reason copy must not claim a Last.fm ranking.
+  assert.doesNotMatch(playlist.tracks[0].reason, /Last\.fm/);
+});

@@ -1,4 +1,3 @@
-import { getLastfmApiKey } from "../apiClients/index.js";
 import { getDiscoveryCache, isDiscoveryPersonalizedEnabled } from "./index.js";
 import { playlistSource } from "../weeklyFlow/weeklyFlowPlaylistSource.js";
 import { flowPlaylistConfig } from "../weeklyFlow/weeklyFlowPlaylistConfig.js";
@@ -166,8 +165,6 @@ export async function generateDiscoverPlaylists({
   historyTopArtists = [],
   onProgress,
 } = {}) {
-  if (!getLastfmApiKey()) return [];
-
   const historyArtists = resolveListeningHistoryPreset({ basedOn, historyTopArtists });
 
   const personalizedEnabled = isDiscoveryPersonalizedEnabled();
