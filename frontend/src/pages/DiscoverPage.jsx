@@ -193,6 +193,7 @@ function DiscoverPage() {
     playlistsUpdating,
     playlistsUpdateMessage,
     configured = true,
+    listenbrainzHistoryConfigured = false,
   } = data || {};
   const [adoptedFlowIds, setAdoptedFlowIds] = useState({});
   const [adoptedStaticPlaylistIds, setAdoptedStaticPlaylistIds] = useState({});
@@ -677,22 +678,22 @@ function DiscoverPage() {
             <h3 className="discover-recommended-status__heading">
               {isUpdating
                 ? "Building your recommendations"
-                : provider === "lastfm"
+                : provider === "lastfm" || provider === "listenbrainz"
                   ? "Not enough listening data yet"
-                  : "Connect Last.fm"}
+                  : "Connect ListenBrainz"}
             </h3>
             {isUpdating && updateProgressMessage ? (
               <p className="discover-recommended-status__message">{updateProgressMessage}</p>
             ) : null}
             {!isUpdating ? (
               <div className="discover-recommended-status__actions">
-                {provider !== "lastfm" ? (
+                {provider !== "lastfm" && provider !== "listenbrainz" ? (
                   <button
                     type="button"
                     onClick={() => navigate("/settings/connect")}
                     className="btn btn-primary btn--bold btn-min-h"
                   >
-                    Connect Last.fm
+                    Connect ListenBrainz
                   </button>
                 ) : (
                   <button
@@ -968,11 +969,11 @@ function DiscoverPage() {
           </li>
           <li>
             <span>•</span>
-            <span>Configure Last.fm (API key and username) in Settings</span>
+            <span>Configure a listening history provider (Last.fm or ListenBrainz) in Settings</span>
           </li>
         </ul>
         <button onClick={() => navigate("/settings/connect")} className="btn btn-primary">
-          Connect Last.fm
+          Connect
         </button>
       </div>
     );
@@ -980,7 +981,7 @@ function DiscoverPage() {
 
   return (
     <div className="artist-discover-page">
-      <LastfmBanner />
+      <LastfmBanner listenbrainzHistoryConfigured={listenbrainzHistoryConfigured} />
       <section className="artist-discover-hero">
         <div className="artist-discover-hero__content">
           <div className="artist-discover-hero__header">

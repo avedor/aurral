@@ -20,6 +20,44 @@ import {
   rerankRecommendations,
 } from "./recommendationPipeline.js";
 import { hydrateRecommendationCandidateTags } from "./tasteProfile.js";
+import { fetchListenbrainzSimilarArtists, fetchListenbrainzArtistTags } from "./listenbrainzRecommendations.js";
+
+const fetchLastfmArtistTags = async (seed, lastfmHealth) => {
+  const tagData = await lastfmRequest(
+    "artist.getTopTags",
+    seed.mbid ? { mbid: seed.mbid } : { artist: seed.artistName },
+  );
+  if (tagData && !tagData.error) lastfmHealth.success++; else lastfmHealth.failure++;
+  if (!tagData?.toptags?.tag) return [];
+
+  const tags = Array.isArray(tagData.toptags.tag)
+    ? tagData.toptags.tag
+    : [tagData.toptags.tag];
+  return normalizeSeedTagList(
+    tags.map((tag) => tag?.name),
+  );
+};
+
+const fetchLastfmSimilarArtists = async (seed, limit, lastfmHealth) => {
+  const similar = await lastfmRequest(
+    "artist.getSimilar",
+    seed.mbid
+      ? { mbid: seed.mbid, limit }
+      : { artist: seed.artistName, limit },
+  );
+  if (similar && !similar.error) lastfmHealth.success++; else lastfmHealth.failure++;
+  if (!similar?.similarartists?.artist) return [];
+
+  const artists = Array.isArray(similar.similarartists.artist)
+    ? similar.similarartists.artist
+    : [similar.similarartists.artist];
+  return artists.map((artist) => ({
+    mbid: artist?.mbid,
+    name: artist?.name,
+    image: pickLastfmImage(artist?.image),
+    match: artist?.match,
+  }));
+};
 
 export const buildRecommendationsFromSeeds = async ({
   seeds,
@@ -30,7 +68,16 @@ export const buildRecommendationsFromSeeds = async ({
   discoveryMode,
   includeCandidateTagHydration = true,
   includeSecondHop = true,
+  source = "lastfm",
 }) => {
+  const useListenbrainz = source === "listenbrainz";
+  const fetchSimilarArtists = useListenbrainz
+    ? (seed, limit) => fetchListenbrainzSimilarArtists(seed, limit, lastfmHealth)
+    : (seed, limit) => fetchLastfmSimilarArtists(seed, limit, lastfmHealth);
+  const fetchArtistTags = useListenbrainz
+    ? (seed) => fetchListenbrainzArtistTags(seed)
+    : (seed) => fetchLastfmArtistTags(seed, lastfmHealth);
+
   const directRecommendations = new Map();
   const { similarLimit, maxPerSeed } = getSimilarArtistSampling(
     getLastfmFailureRatio(lastfmHealth),
@@ -46,39 +93,16 @@ export const buildRecommendationsFromSeeds = async ({
         if (sourceTags.length > 0) {
           lastfmHealth.success++;
         } else {
-          const tagData = await lastfmRequest(
-            "artist.getTopTags",
-            seed.mbid ? { mbid: seed.mbid } : { artist: seed.artistName },
-          );
-          if (tagData && !tagData.error) lastfmHealth.success++; else lastfmHealth.failure++;
-          if (tagData?.toptags?.tag) {
-            const tags = Array.isArray(tagData.toptags.tag)
-              ? tagData.toptags.tag
-              : [tagData.toptags.tag];
-            sourceTags = normalizeSeedTagList(
-              tags.map((tag) => tag?.name),
-            );
-          }
+          sourceTags = await fetchArtistTags(seed);
         }
 
-        const similar = await lastfmRequest(
-          "artist.getSimilar",
-          seed.mbid
-            ? { mbid: seed.mbid, limit: similarLimit }
-            : { artist: seed.artistName, limit: similarLimit },
-        );
-        if (similar && !similar.error) lastfmHealth.success++; else lastfmHealth.failure++;
-        if (!similar?.similarartists?.artist) return;
-
-        const artists = Array.isArray(similar.similarartists.artist)
-          ? similar.similarartists.artist
-          : [similar.similarartists.artist];
-        for (const artist of artists.slice(0, maxPerSeed)) {
+        const similar = await fetchSimilarArtists(seed, similarLimit);
+        for (const artist of similar.slice(0, maxPerSeed)) {
           addRecommendationCandidate(directRecommendations, {
             candidate: {
               mbid: artist?.mbid,
               name: artist?.name,
-              image: pickLastfmImage(artist?.image),
+              image: artist?.image ?? null,
               match: artist?.match,
               discoveryDepth: 1,
             },
@@ -114,6 +138,9 @@ export const buildRecommendationsFromSeeds = async ({
         1,
       ),
       depth: 1,
+      fetchTags: useListenbrainz
+        ? (item) => fetchListenbrainzArtistTags(item)
+        : null,
     });
   }
   directList = rerankRecommendations(directList, candidateLimit, {
@@ -164,7 +191,7 @@ export const buildRecommendationsFromSeeds = async ({
         const bridgeSeed = {
           mbid: bridge.id || bridge.mbid || null,
           artistName: bridge.name,
-          source: "lastfm_related",
+          source: useListenbrainz ? "listenbrainz_related" : "lastfm_related",
           profileBucket: "two_hop_bridge",
           weight: bridgeWeight,
           affinityWeight: bridgeWeight,
@@ -172,27 +199,13 @@ export const buildRecommendationsFromSeeds = async ({
           similarityMultiplier: 0.55,
           tagAffinityMultiplier: 0.55,
         };
-        const similar = await lastfmRequest(
-          "artist.getSimilar",
-          bridgeSeed.mbid
-            ? { mbid: bridgeSeed.mbid, limit: secondHopSampling.similarLimit }
-            : {
-                artist: bridgeSeed.artistName,
-                limit: secondHopSampling.similarLimit,
-              },
-        );
-        if (similar && !similar.error) lastfmHealth.success++; else lastfmHealth.failure++;
-        if (!similar?.similarartists?.artist) return;
-
-        const artists = Array.isArray(similar.similarartists.artist)
-          ? similar.similarartists.artist
-          : [similar.similarartists.artist];
-        for (const artist of artists.slice(0, secondHopSampling.maxPerSeed)) {
+        const similar = await fetchSimilarArtists(bridgeSeed, secondHopSampling.similarLimit);
+        for (const artist of similar.slice(0, secondHopSampling.maxPerSeed)) {
           addRecommendationCandidate(secondHopRecommendations, {
             candidate: {
               mbid: artist?.mbid,
               name: artist?.name,
-              image: pickLastfmImage(artist?.image),
+              image: artist?.image ?? null,
               match: artist?.match,
               discoveryDepth: 2,
               similarityMultiplier: 0.55,
@@ -228,6 +241,9 @@ export const buildRecommendationsFromSeeds = async ({
       2,
     ),
     depth: 2,
+    fetchTags: useListenbrainz
+      ? (item) => fetchListenbrainzArtistTags(item)
+      : null,
   });
   secondHopList = rerankRecommendations(
     secondHopList,

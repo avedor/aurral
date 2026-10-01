@@ -40,8 +40,10 @@ import { getDownloadSourceStatus } from "../services/downloadSourceService.js";
 import { getMatcherStatus } from "../services/trackMatching/index.js";
 import {
   DISCOVERY_PROVIDER_LASTFM,
+  DISCOVERY_PROVIDER_LISTENBRAINZ,
   DISCOVERY_PROVIDER_LISTENBRAINZ_FALLBACK,
   getDiscoveryCapabilities,
+  hasListenbrainzHistoryProfile,
 } from "../services/listenbrainzDiscoveryFallback.js";
 
 const router = express.Router();
@@ -358,11 +360,17 @@ router.get("/", noCache, async (req, res) => {
       const discoveryUpdateStatus = getDiscoveryUpdateStatus();
       const artworkLinkCount = dbOps.countImages();
       const nativeImageCacheSizeBytes = await getImageProxyCacheSizeBytes();
+      const listenbrainzHistoryConfigured = hasListenbrainzHistoryProfile();
       payload.discovery = {
         provider: getLastfmApiKey()
           ? DISCOVERY_PROVIDER_LASTFM
-          : DISCOVERY_PROVIDER_LISTENBRAINZ_FALLBACK,
-        capabilities: getDiscoveryCapabilities(!!getLastfmApiKey()),
+          : listenbrainzHistoryConfigured
+            ? DISCOVERY_PROVIDER_LISTENBRAINZ
+            : DISCOVERY_PROVIDER_LISTENBRAINZ_FALLBACK,
+        capabilities: getDiscoveryCapabilities(
+          !!getLastfmApiKey(),
+          listenbrainzHistoryConfigured,
+        ),
         lastUpdated: discoveryCache?.lastUpdated || null,
         isUpdating: !!discoveryCache?.isUpdating,
         ...discoveryUpdateStatus,

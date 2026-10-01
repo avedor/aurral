@@ -175,6 +175,7 @@ export const hydrateRecommendationCandidateTags = async ({
   profileTagWeights,
   limit,
   depth = 1,
+  fetchTags = null,
 }) => {
   const { canInheritTagsFromSeeds } = await import("./helpers.js");
   const items = Array.isArray(recommendations) ? [...recommendations] : [];
@@ -194,7 +195,9 @@ export const hydrateRecommendationCandidateTags = async ({
               source: "inherited",
             });
           }
-          const tags = await fetchArtistTagNames(item, lastfmHealth);
+          const tags = fetchTags
+            ? await fetchTags(item)
+            : await fetchArtistTagNames(item, lastfmHealth);
           return applyHydratedCandidateTags(item, tags, profileTagWeights, {
             tagAffinityMultiplier: depth >= 2 ? 0.55 : 1,
           });

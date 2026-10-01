@@ -2,8 +2,15 @@ import { dbOps } from "../../db/helpers/index.js";
 import { websocketService } from "../websocketService.js";
 import {
   DISCOVERY_PROVIDER_LASTFM,
+  DISCOVERY_PROVIDER_LISTENBRAINZ,
   getDiscoveryCapabilities,
 } from "../listenbrainzDiscoveryFallback.js";
+
+const capabilitiesForProvider = (provider) =>
+  getDiscoveryCapabilities(
+    provider === DISCOVERY_PROVIDER_LASTFM,
+    provider === DISCOVERY_PROVIDER_LISTENBRAINZ,
+  );
 import {
   getListenHistoryCacheNamespace,
 } from "../listeningHistory.js";
@@ -57,10 +64,7 @@ if (
     fallbackGenrePools: dbData.fallbackGenrePools || {},
     discoverPlaylists: dbData.discoverPlaylists || [],
     provider: dbData.provider || DISCOVERY_PROVIDER_LASTFM,
-    capabilities: getDiscoveryCapabilities(
-      (dbData.provider || DISCOVERY_PROVIDER_LASTFM) ===
-        DISCOVERY_PROVIDER_LASTFM,
-    ),
+    capabilities: capabilitiesForProvider(dbData.provider || DISCOVERY_PROVIDER_LASTFM),
     lastUpdated: dbData.lastUpdated || null,
     metadata: dbData.metadata || {},
     recommendationQuality: dbData.recommendationQuality || null,
@@ -81,8 +85,8 @@ export function reloadDiscoveryPersistedCache() {
   const persisted = dbOps.getDiscoveryCache();
   Object.assign(discoveryCache, persisted, {
     provider: persisted.provider || DISCOVERY_PROVIDER_LASTFM,
-    capabilities: getDiscoveryCapabilities(
-      (persisted.provider || DISCOVERY_PROVIDER_LASTFM) === DISCOVERY_PROVIDER_LASTFM,
+    capabilities: capabilitiesForProvider(
+      persisted.provider || DISCOVERY_PROVIDER_LASTFM,
     ),
   });
 }
@@ -121,11 +125,15 @@ export const getDiscoveryCache = (listenHistoryProfile = null) => {
           userDbData.discoverPlaylists?.length > 0
             ? userDbData.discoverPlaylists
             : discoveryCache.discoverPlaylists || [],
-        provider: discoveryCache.provider || DISCOVERY_PROVIDER_LASTFM,
+        provider:
+          userDbData.provider ||
+          discoveryCache.provider ||
+          DISCOVERY_PROVIDER_LASTFM,
         capabilities:
           discoveryCache.capabilities ||
-          getDiscoveryCapabilities(
-            (discoveryCache.provider || DISCOVERY_PROVIDER_LASTFM) ===
+          capabilitiesForProvider(
+            userDbData.provider ||
+              discoveryCache.provider ||
               DISCOVERY_PROVIDER_LASTFM,
           ),
         lastUpdated:

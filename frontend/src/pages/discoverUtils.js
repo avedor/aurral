@@ -235,6 +235,7 @@ export const normalizeDiscoveryData = (value) => {
     enrichmentCompletedAt: value.enrichmentCompletedAt || null,
     enrichmentProgressMessage: value.enrichmentProgressMessage || null,
     stale: !!value.stale,
+    listenbrainzHistoryConfigured: !!value.listenbrainzHistoryConfigured,
     discoveryMode:
       value.discoveryMode === "safer" || value.discoveryMode === "deeper"
         ? value.discoveryMode

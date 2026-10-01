@@ -54,3 +54,38 @@ test("cached discovery applies per-user blocks to fallback sections and playlist
   discovery.removeDiscoveryFeedback(7, block.id);
   assert.equal((await getUserDiscovery(7, 0)).body.discoverPlaylists.length, 2);
 });
+
+test("a listenbrainz listening-history user gets personalized discovery without a lastfm key", async () => {
+  db.prepare(
+    `INSERT INTO users (id, username, password_hash, role, listen_history_provider, listen_history_username)
+     VALUES (7, 'lb-user', 'hash', 'user', 'listenbrainz', 'lb-listener')`,
+  ).run();
+  dbOps.updateDiscoveryCache({
+    recommendations: [{ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", name: "Recommended" }],
+    basedOn: [{ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", name: "Seed" }],
+    provider: "listenbrainz",
+  });
+  persistedDiscovery.reloadDiscoveryPersistedCache();
+
+  const { body } = await getUserDiscovery(7, 0);
+  assert.equal(body.provider, "listenbrainz");
+  assert.equal(body.capabilities.personalizedRecommendations, true);
+  assert.equal(body.listenbrainzHistoryConfigured, true);
+  assert.deepEqual(body.recommendations.map((artist) => artist.name), ["Recommended"]);
+});
+
+test("the fallback provider upgrades to listenbrainz once a history profile exists", async () => {
+  dbOps.updateDiscoveryCache({ recommendations: [], provider: "listenbrainz-fallback" });
+  persistedDiscovery.reloadDiscoveryPersistedCache();
+  const before = await getUserDiscovery(7, 0);
+  assert.equal(before.body.provider, "listenbrainz-fallback");
+  assert.equal(before.body.capabilities.personalizedRecommendations, false);
+
+  db.prepare(
+    `INSERT INTO users (id, username, password_hash, role, listen_history_provider, listen_history_username)
+     VALUES (7, 'lb-user', 'hash', 'user', 'listenbrainz', 'lb-listener')`,
+  ).run();
+  const after = await getUserDiscovery(7, 0);
+  assert.equal(after.body.provider, "listenbrainz");
+  assert.equal(after.body.capabilities.personalizedRecommendations, true);
+});

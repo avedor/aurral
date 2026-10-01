@@ -65,7 +65,11 @@ export function SettingsDiscoverTab({
     settings.integrations?.lastfm?.discoveryRecommendationsPerRefresh ?? 200;
   const discoveryPersonalizedEnabled = settings.integrations?.lastfm?.discoveryPersonalizedEnabled !== false;
   const discoveryProvider =
-    health?.discovery?.provider === "listenbrainz-fallback" ? "ListenBrainz fallback" : "Last.fm";
+    health?.discovery?.provider === "listenbrainz-fallback"
+      ? "ListenBrainz fallback"
+      : health?.discovery?.provider === "listenbrainz"
+        ? "ListenBrainz"
+        : "Last.fm";
   const isListenBrainzFallback = health?.discovery?.provider === "listenbrainz-fallback";
   const showLastfmDiscoverBanner = isListenBrainzFallback && !lastfmBannerDismissed;
   const activeProgress = discoveryProgress ?? health?.discovery?.updateProgress;
