@@ -1,3 +1,4 @@
+import { setTimeout as wait } from "node:timers/promises";
 import axios from "../../lib/axiosFetch.js";
 import crypto from "crypto";
 import { logger } from "./logger.js";
@@ -19,7 +20,6 @@ const NAVIDROME_RETRYABLE_READ_ENDPOINTS = new Set([
   "getPlaylist",
 ]);
 
-const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 function normalizeLibraryPath(value) {
   return String(value || "")
@@ -256,6 +256,10 @@ export class NavidromeClient {
     });
     const playlist = data.playlist || null;
     if (!playlist?.id) return playlist;
+    await this.request("updatePlaylist", {
+      playlistId: playlist.id,
+      public: true,
+    });
     for (let index = PLAYLIST_SONG_BATCH_SIZE; index < ids.length; index += PLAYLIST_SONG_BATCH_SIZE) {
       await this.request("updatePlaylist", {
         playlistId: playlist.id,

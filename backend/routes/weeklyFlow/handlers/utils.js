@@ -7,7 +7,9 @@ import {
 import { weeklyFlowOperationQueue } from "../../../services/weeklyFlow/weeklyFlowOperationQueue.js";
 import {
   createWeeklyFlowOperationToken,
+  getLatestWeeklyFlowOperationToken,
   markLatestWeeklyFlowOperationToken,
+  restoreWeeklyFlowOperationToken,
 } from "../../../services/weeklyFlow/weeklyFlowOperations.js";
 import {
   restartWorkerIfPending,
@@ -20,14 +22,6 @@ import {
 import { logger } from "../../../services/logger.js";
 
 export const EXISTING_FILE_MODE_OPTIONS = ["download", "reuse"];
-export const AUDIO_CONTENT_TYPES = {
-  ".mp3": "audio/mpeg",
-  ".m4a": "audio/mp4",
-  ".aac": "audio/aac",
-  ".flac": "audio/flac",
-  ".ogg": "audio/ogg",
-  ".wav": "audio/wav",
-};
 export const DEFAULT_LIMIT = DEFAULT_SIZE;
 
 const getFlowEntryName = (value) => {
@@ -82,6 +76,7 @@ export const validateFlowPayload = ({
   relatedArtists,
   scheduleDays,
   recordHistory,
+  showInLibrary,
   yearFrom,
   yearTo,
 } = {}) => {
@@ -110,6 +105,9 @@ export const validateFlowPayload = ({
   if (recordHistory !== undefined && typeof recordHistory !== "boolean") {
     return "recordHistory must be a boolean";
   }
+  if (showInLibrary !== undefined && typeof showInLibrary !== "boolean") {
+    return "showInLibrary must be a boolean";
+  }
   const hasYearFrom = yearFrom != null && String(yearFrom).trim() !== "";
   const hasYearTo = yearTo != null && String(yearTo).trim() !== "";
   if (hasYearFrom) {
@@ -128,14 +126,26 @@ export const validateFlowPayload = ({
 };
 
 export const markFlowMutationToken = (flowId) => {
-  const token = createWeeklyFlowOperationToken();
   const tokenScope = `flow:${flowId}:mutation`;
+  const previousToken = getLatestWeeklyFlowOperationToken(tokenScope);
+  const token = createWeeklyFlowOperationToken();
   markLatestWeeklyFlowOperationToken(tokenScope, token);
-  return { token, tokenScope };
+  return { token, tokenScope, previousToken };
 };
 
+export const isFlowMutationTokenCurrent = (mutation) =>
+  Boolean(mutation?.token) &&
+  getLatestWeeklyFlowOperationToken(mutation.tokenScope) === mutation.token;
+
+export const restoreFlowMutationToken = (mutation) =>
+  restoreWeeklyFlowOperationToken({
+    scope: mutation?.tokenScope,
+    token: mutation?.token,
+    previousToken: mutation?.previousToken,
+  });
+
 export const pauseSharedPlaylistRetryCycle = async (playlistId) => {
-  weeklyFlowWorker.setRetryCyclePaused(playlistId, true);
+  await weeklyFlowWorker.setRetryCyclePaused(playlistId, true);
   let cancelledJobs = 0;
   await withPlaylistMutation(playlistId, async () => {
     cancelledJobs = downloadTracker.failActiveJobsForPlaylist(
@@ -171,13 +181,19 @@ export const canAccessPlaylistType = (user, playlistType) => {
   return false;
 };
 
+export const LIBRARY_JOB_TYPE = "library";
+
+export const canAccessJobType = (user, playlistType) =>
+  playlistType === LIBRARY_JOB_TYPE || canAccessPlaylistType(user, playlistType);
+
 export const filterJobsForUser = (user, jobs) =>
   (Array.isArray(jobs) ? jobs : []).filter((job) =>
-    canAccessPlaylistType(user, job?.playlistId || job?.playlistType),
+    canAccessJobType(user, job?.playlistId || job?.playlistType),
   );
 
 export const queueFlowSideEffect = (kind, labelPrefix, flowId) => {
-  const { token, tokenScope } = markFlowMutationToken(flowId);
+  const mutation = markFlowMutationToken(flowId);
+  const { token, tokenScope } = mutation;
   weeklyFlowOperationQueue
     .enqueuePayload({
       kind,
@@ -187,12 +203,13 @@ export const queueFlowSideEffect = (kind, labelPrefix, flowId) => {
       token,
     })
     .catch((error) => {
+      restoreFlowMutationToken(mutation);
       logger.error("weeklyFlow", `Failed to ${labelPrefix} flow ${flowId}:`, { message: error.message });
     });
 };
 
 export const enqueueResearchTrack = async (req, res, playlistId, jobId, labelPrefix) => {
-  if (!canAccessPlaylistType(req.user, playlistId)) {
+  if (!canAccessJobType(req.user, playlistId)) {
     return res.status(404).json({ error: "Playlist not found" });
   }
 
@@ -204,6 +221,11 @@ export const enqueueResearchTrack = async (req, res, playlistId, jobId, labelPre
   if (job.status === "pending" || job.status === "downloading") {
     return res.status(409).json({
       error: "Track is already being processed",
+    });
+  }
+  if (downloadTracker.findActiveUpgradeJob(job)) {
+    return res.status(409).json({
+      error: "A search for this track is already running",
     });
   }
 

@@ -4,12 +4,16 @@ import honker from "@russellthehippo/honker-node";
 import { resolveAurralDataDir } from "../config/data-dir.js";
 import { dbOps } from "../db/helpers/index.js";
 import { resolvePlaylistRoot } from "./playlistPaths.js";
+import { ISOLATED_QUEUE_GROUPS, shouldStartQueueHere } from "./backgroundWorkerQueues.js";
 
 export const PLAYLIST_STARTUP_MIGRATION_VERSION = 1;
 export const PLAYLIST_STARTUP_MIGRATION_SETTING = "playlistStartupMigration";
 
 export const HONKER_QUEUE_NAMES = [
   "system-task",
+  "release-metadata-refresh",
+  "system-task-maintenance",
+  "system-task-inbox",
   "weekly-flow-operation",
   "slskd-pipeline",
   "playlist-retry",
@@ -36,9 +40,26 @@ let playEventOutbox = null;
 let honkerSchedulerStarted = false;
 let honkerSchedulerAbort = null;
 let honkerSchedulerPromise = null;
+let queueWakeHandler = null;
 const WORKER_ID = `aurral-${process.pid}`;
 const DEFAULT_HONKER_WATCHER_POLL_MS = 25;
 const MISSED_FIRE_GRACE_S = 300;
+
+export function configureHonkerQueueWake(handler) {
+  queueWakeHandler = typeof handler === "function" ? handler : null;
+}
+
+function wakeQueueOwner(name) {
+  try {
+    if (process.env.AURRAL_BACKGROUND_WORKER_GROUP && process.connected) {
+      process.send({ type: "queue-wake", queue: name });
+    } else {
+      queueWakeHandler?.(name);
+    }
+  } catch (error) {
+    console.warn("[Honker] Could not wake queued work:", error?.message || error);
+  }
+}
 
 export function getHonkerOpenOptions() {
   const configured = Number(process.env.AURRAL_HONKER_WATCHER_POLL_MS);
@@ -51,13 +72,13 @@ export function getHonkerOpenOptions() {
 export const SCHEDULED_SYSTEM_TASKS = [
   {
     name: "weekly-flow-refresh",
-    queue: "system-task",
+    queue: "system-task-maintenance",
     schedule: "@every 1h",
     payload: { kind: "weekly-flow-refresh" },
   },
   {
     name: "session-cleanup",
-    queue: "system-task",
+    queue: "system-task-maintenance",
     schedule: "@every 1h",
     payload: { kind: "session-cleanup" },
   },
@@ -82,13 +103,13 @@ export const SCHEDULED_SYSTEM_TASKS = [
   },
   {
     name: "inbox-refresh",
-    queue: "system-task",
+    queue: "system-task-inbox",
     schedule: "@every 24h",
     payload: { kind: "inbox-refresh" },
   },
   {
     name: "news-refresh",
-    queue: "system-task",
+    queue: "system-task-maintenance",
     schedule: "@every 15m",
     payload: { kind: "news-refresh" },
   },
@@ -97,6 +118,19 @@ export const SCHEDULED_SYSTEM_TASKS = [
     queue: "system-task",
     schedule: "@every 30m",
     payload: { kind: "import-list-sync" },
+  },
+  {
+    name: "release-metadata-refresh",
+    queue: "release-metadata-refresh",
+    schedule: "@every 24h",
+    payload: { kind: "release-metadata-refresh" },
+    priority: -5,
+  },
+  {
+    name: "aurral-monitoring-reconcile",
+    queue: "system-task",
+    schedule: "@every 24h",
+    payload: { kind: "aurral-monitoring-reconcile" },
   },
   {
     name: "playlist-mbid-enrichment-sweep",
@@ -140,7 +174,7 @@ function resolveEnqueueRunAt(options) {
   return null;
 }
 
-function parseHonkerPayload(value) {
+export function parseHonkerPayload(value) {
   try {
     const payload = typeof value === "string" ? JSON.parse(value) : value;
     return payload && typeof payload === "object" && !Array.isArray(payload)
@@ -149,6 +183,20 @@ function parseHonkerPayload(value) {
   } catch {
     return null;
   }
+}
+
+export function listHonkerJobs(queueName) {
+  const safeQueue = String(queueName || "").trim();
+  if (!safeQueue) return [];
+  return getHonkerDb()
+    .query(
+      `SELECT id, payload, state, run_at, claim_expires_at, attempts
+       FROM _honker_live
+       WHERE queue = ?
+       ORDER BY id ASC`,
+      [safeQueue],
+    )
+    .map((row) => ({ ...row, payload: parseHonkerPayload(row.payload) }));
 }
 
 function createHonkerQueue({
@@ -174,10 +222,12 @@ function createHonkerQueue({
     const runAt = resolveEnqueueRunAt(options);
     const priority = defaultPriorityFn(payload, options);
     const jobId = q.enqueue(payload, { priority, runAt });
-    if (!(skipInTest && process.env.NODE_ENV === "test")) {
+    if (shouldStartQueueHere(name) && !(skipInTest && process.env.NODE_ENV === "test")) {
       import(workerModule)
         .then((mod) => mod[workerStartFn]())
         .catch((err) => { console.warn(err); });
+    } else {
+      wakeQueueOwner(name);
     }
     return jobId;
   }
@@ -293,7 +343,51 @@ const systemTask = registerQueue({
 });
 
 export const getSystemTaskQueue = systemTask.getQueue;
-export const enqueueSystemTaskJob = systemTask.enqueueJob;
+
+const releaseMetadata = registerQueue({
+  name: "release-metadata-refresh",
+  visibilityTimeoutS: 3600,
+  maxAttempts: 3,
+  workerModule: "./releaseMetadataWorker.js",
+  workerStartFn: "startReleaseMetadataWorker",
+  skipInTest: true,
+});
+export const getReleaseMetadataQueue = releaseMetadata.getQueue;
+
+const maintenanceTask = registerQueue({
+  name: "system-task-maintenance",
+  visibilityTimeoutS: 3600,
+  maxAttempts: 3,
+  workerModule: "./systemTaskWorker.js",
+  workerStartFn: "startMaintenanceTaskWorker",
+});
+export const getMaintenanceTaskQueue = maintenanceTask.getQueue;
+
+const inboxTask = registerQueue({
+  name: "system-task-inbox",
+  visibilityTimeoutS: 3600,
+  maxAttempts: 3,
+  workerModule: "./systemTaskWorker.js",
+  workerStartFn: "startInboxTaskWorker",
+});
+export const getInboxTaskQueue = inboxTask.getQueue;
+
+export function getSystemTaskQueueName(kind) {
+  if (kind === "release-metadata-refresh") return "release-metadata-refresh";
+  if (kind === "inbox-refresh") return "system-task-inbox";
+  if (kind === "session-cleanup" || kind === "news-refresh" ||
+      kind === "weekly-flow-refresh") return "system-task-maintenance";
+  return "system-task";
+}
+
+export function enqueueSystemTaskJob(payload, options) {
+  switch (getSystemTaskQueueName(payload?.kind)) {
+    case "release-metadata-refresh": return releaseMetadata.enqueueJob(payload, options);
+    case "system-task-inbox": return inboxTask.enqueueJob(payload, options);
+    case "system-task-maintenance": return maintenanceTask.enqueueJob(payload, options);
+    default: return systemTask.enqueueJob(payload, options);
+  }
+}
 
 const libraryScan = registerQueue({
   name: "library-scan",
@@ -329,11 +423,14 @@ export function getNotificationOutbox() {
 
 export function enqueueNotification(payload) {
   const jobId = getNotificationOutbox().enqueue(payload);
-  import("./notificationOutboxWorker.js")
-    .then(({ startNotificationOutboxWorker }) =>
-      startNotificationOutboxWorker(),
-    )
-    .catch((err) => { console.warn(err); });  return jobId;
+  if (shouldStartQueueHere("_outbox:notifications")) {
+    import("./notificationOutboxWorker.js")
+      .then(({ startNotificationOutboxWorker }) => startNotificationOutboxWorker())
+      .catch((err) => { console.warn(err); });
+  } else {
+    wakeQueueOwner("_outbox:notifications");
+  }
+  return jobId;
 }
 
 export function getPlayEventOutbox() {
@@ -354,13 +451,33 @@ export function getPlayEventOutbox() {
 
 export function enqueuePlayEventDelivery(payload) {
   const jobId = getPlayEventOutbox().enqueue(payload);
-  import("./playEventOutboxWorker.js")
-    .then(({ startPlayEventOutboxWorker }) => startPlayEventOutboxWorker())
-    .catch((err) => { console.warn(err); });
+  if (shouldStartQueueHere("_outbox:play-events")) {
+    import("./playEventOutboxWorker.js")
+      .then(({ startPlayEventOutboxWorker }) => startPlayEventOutboxWorker())
+      .catch((err) => { console.warn(err); });
+  } else {
+    wakeQueueOwner("_outbox:play-events");
+  }
   return jobId;
 }
 
+function migrateLegacyReleaseMetadataJobs() {
+  const tx = getHonkerDb().transaction();
+  try {
+    tx.execute(`UPDATE _honker_live
+      SET queue = ?, state = 'pending', worker_id = NULL, claim_expires_at = NULL
+      WHERE queue = ? AND json_extract(payload, '$.kind') = ?
+        AND (state = 'pending' OR (state = 'processing' AND claim_expires_at <= unixepoch()))`,
+    ["release-metadata-refresh", "system-task", "release-metadata-refresh"]);
+    tx.commit();
+  } catch (error) {
+    tx.rollback();
+    throw error;
+  }
+}
+
 export function bootstrapHonkerSchedules() {
+  migrateLegacyReleaseMetadataJobs();
   const scheduler = getHonkerDb().scheduler();
   const canonicalByName = new Map(SCHEDULED_SYSTEM_TASKS.map((task) => [task.name, task]));
   const existingByName = new Map(scheduler.list().map((row) => [row.name, row]));
@@ -383,19 +500,28 @@ export function bootstrapHonkerSchedules() {
     const maxAttempts = Number(task.maxAttempts ?? 3);
     const payloadText = JSON.stringify(task.payload ?? null);
 
-    // Queue changes require re-registration. Other fields can use the
-    // supported update API so an unchanged schedule keeps next_fire_at.
     if (existing.queue !== task.queue) {
-      scheduler.remove(task.name);
-      scheduler.add(task);
-      continue;
+      if (task.name === "release-metadata-refresh") {
+        const tx = getHonkerDb().transaction();
+        try {
+          tx.execute("UPDATE _honker_scheduler_tasks SET queue = ? WHERE name = ?", [task.queue, task.name]);
+          tx.commit();
+        } catch (error) {
+          tx.rollback();
+          throw error;
+        }
+      } else {
+        scheduler.remove(task.name);
+        scheduler.add(task);
+        continue;
+      }
     }
 
     const updates = {};
     if (
       existing.cron_expr !== task.schedule ||
-      Number(existing.next_fire_at || 0) <=
-        Math.floor(Date.now() / 1000) - MISSED_FIRE_GRACE_S
+      (task.name !== "release-metadata-refresh" && Number(existing.next_fire_at || 0) <=
+        Math.floor(Date.now() / 1000) - MISSED_FIRE_GRACE_S)
     ) {
       updates.schedule = task.schedule;
     }
@@ -416,8 +542,11 @@ export function bootstrapHonkerSchedules() {
 
 export function enqueueHonkerStartupTasks() {
   const enqueueIfAbsent = (payload, options) => {
-    const existing = findActiveHonkerJob(
-      "system-task",
+    const legacy = payload.kind === "release-metadata-refresh"
+      ? findActiveHonkerJob("system-task", (candidate) => candidate?.kind === payload.kind, { recoverExpired: true })
+      : null;
+    const existing = legacy || findActiveHonkerJob(
+      getSystemTaskQueueName(payload.kind),
       (candidate) => candidate?.kind === payload.kind,
       { recoverExpired: true },
     );
@@ -436,6 +565,7 @@ export function enqueueHonkerStartupTasks() {
   enqueueIfAbsent({ kind: "weekly-flow-startup-check" }, { delaySeconds: 5, priority: 5 });
   enqueueIfAbsent({ kind: "discovery-bootstrap" }, { delaySeconds: 15, priority: 5 });
   enqueueIfAbsent({ kind: "library-index-bootstrap" }, { delaySeconds: 8, priority: 0 });
+  enqueueIfAbsent({ kind: "release-metadata-refresh" }, { delaySeconds: 12, priority: -5 });
 }
 
 export function findActiveHonkerJob(
@@ -629,6 +759,47 @@ export function getHonkerQueueDepth(queueName) {
   return Number(row?.count) || 0;
 }
 
+export function hasClaimableHonkerJobs(queueName) {
+  return Boolean(getHonkerDb().query(
+    `SELECT 1 FROM _honker_live WHERE queue = ? AND run_at <= ?
+     AND (state = 'pending' OR (state = 'processing' AND claim_expires_at <= ?)) LIMIT 1`,
+    [queueName, Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000)],
+  )[0]);
+}
+
+export function hasActiveHonkerJobs(queueName) {
+  return Boolean(getHonkerDb().query(
+    `SELECT 1 FROM _honker_live WHERE queue = ?
+     AND (state = 'processing' OR (state = 'pending' AND run_at <= ?)) LIMIT 1`,
+    [queueName, Math.floor(Date.now() / 1000)],
+  )[0]);
+}
+
+export function isHonkerScheduleDue() {
+  return Boolean(getHonkerDb().query(
+    "SELECT 1 FROM _honker_scheduler_tasks WHERE enabled = 1 AND next_fire_at <= ? LIMIT 1",
+    [Math.floor(Date.now() / 1000)],
+  )[0]);
+}
+
+export function listBackgroundGroupsWithWork() {
+  const now = Math.floor(Date.now() / 1000);
+  const groups = new Set(getHonkerDb().query(
+    `SELECT DISTINCT queue FROM _honker_live WHERE run_at <= ?
+     AND (state = 'pending' OR (state = 'processing' AND claim_expires_at <= ?))`,
+    [now, now],
+  ).map((row) => ISOLATED_QUEUE_GROUPS[row.queue]).filter(Boolean));
+  if (isHonkerScheduleDue()) groups.add("scheduler");
+  return [...groups];
+}
+
+export function hasExpiredHonkerClaims(queueName) {
+  return Boolean(getHonkerDb().query(
+    "SELECT 1 FROM _honker_live WHERE queue = ? AND state = 'processing' AND claim_expires_at <= ? LIMIT 1",
+    [queueName, Math.floor(Date.now() / 1000)],
+  )[0]);
+}
+
 export function sweepAllHonkerQueues() {
   let swept = 0;
   for (const queueName of HONKER_QUEUE_NAMES) {
@@ -658,4 +829,54 @@ export function getHonkerQueueNextClaimAt(queueName) {
   const value = queue && typeof queue._nextClaimAt === "function" ? queue._nextClaimAt() : null;
   const timestamp = Number(value);
   return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : null;
+}
+
+export function requeueInterruptedHonkerJob(job, queue, { refundAttempt = true } = {}) {
+  const tx = getHonkerDb().transaction();
+  try {
+    tx.execute(`UPDATE _honker_live
+      SET state = 'pending', worker_id = NULL, claim_expires_at = NULL,
+          run_at = unixepoch() + 1, attempts = MAX(0, attempts - ?)
+      WHERE id = ? AND queue = ? AND worker_id = ? AND state = 'processing'`,
+    [refundAttempt ? 1 : 0, job.id, queue.name, getWorkerId()]);
+    tx.commit();
+  } catch (error) {
+    tx.rollback();
+    throw error;
+  }
+}
+
+export function adjustHonkerClaimAttempts(job, queue, delta) {
+  const tx = getHonkerDb().transaction();
+  try {
+    const changed = tx.execute(`UPDATE _honker_live SET attempts = MAX(0, attempts + ?)
+      WHERE id = ? AND queue = ? AND worker_id = ? AND state = 'processing'`,
+    [delta, job.id, queue.name, getWorkerId()]);
+    tx.commit();
+    return changed > 0;
+  } catch (error) {
+    tx.rollback();
+    throw error;
+  }
+}
+
+export function restoreReleaseMetadataQueueForRollback() {
+  const tx = getHonkerDb().transaction();
+  try {
+    tx.execute(`UPDATE _honker_live SET state = 'pending', worker_id = NULL, claim_expires_at = NULL
+      WHERE queue = ? AND state = 'processing' AND claim_expires_at <= unixepoch()`,
+    ["release-metadata-refresh"]);
+    const processing = tx.query("SELECT id FROM _honker_live WHERE queue = ? AND state = 'processing' LIMIT 1",
+      ["release-metadata-refresh"]);
+    if (processing.length) throw new Error("Stop and drain the metadata worker before rollback");
+    const moved = tx.execute("UPDATE _honker_live SET queue = ? WHERE queue = ? AND state = 'pending'",
+      ["system-task", "release-metadata-refresh"]);
+    tx.execute("UPDATE _honker_scheduler_tasks SET queue = ? WHERE name = ?",
+      ["system-task", "release-metadata-refresh"]);
+    tx.commit();
+    return moved;
+  } catch (error) {
+    tx.rollback();
+    throw error;
+  }
 }

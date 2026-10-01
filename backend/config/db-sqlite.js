@@ -3,6 +3,7 @@ import path from "path";
 import fs from "fs";
 import { initializeSchemaOnStartup } from "./schema-migration-v2.js";
 import { initializeLibrarySearchIndex } from "./library-search-index.js";
+import { ensureUniqueLidarrArtistIdIndex } from "./lidarr-artist-index.js";
 import { syncDownloadFolderPath } from "../services/downloadFolderConfig.js";
 import { ensureDataDir } from "./data-dir.js";
 
@@ -18,9 +19,24 @@ if (!fs.existsSync(path.dirname(DB_PATH))) {
 
 const db = new Database(DB_PATH);
 
-db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
 db.pragma("busy_timeout = 5000");
+for (let attempt = 0; attempt < 5; attempt++) {
+  try {
+    if (db.pragma("journal_mode", { simple: true }) !== "wal") {
+      db.pragma("journal_mode = WAL");
+    }
+    break;
+  } catch (error) {
+    if (!String(error?.code || "").startsWith("SQLITE_BUSY") || attempt === 4) throw error;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
 db.pragma("synchronous = NORMAL");
+// Worker processes share this file. A deferred transaction that reads before it writes
+// fails with SQLITE_BUSY without waiting when another process writes first.
+const createTransaction = db.transaction.bind(db);
+db.transaction = (fn) => createTransaction(fn).immediate;
 db.pragma("cache_size = -24000");
 db.pragma("mmap_size = 25165824");
 
@@ -76,6 +92,18 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     ip_address TEXT,
     user_agent TEXT,
+    reauthenticated_at INTEGER,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS user_identities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    provider_type TEXT NOT NULL,
+    provider_key TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    display_name TEXT,
+    linked_at INTEGER NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 
@@ -101,6 +129,14 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 
+  -- Unstarring deletes rows, so MAX(subsonic_stars.created_at) can move backwards. This stamp
+  -- only ever advances, which is what getIndexes needs to answer ifModifiedSince honestly.
+  CREATE TABLE IF NOT EXISTS subsonic_star_changes (
+    user_id INTEGER PRIMARY KEY,
+    changed_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
   CREATE TABLE IF NOT EXISTS play_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -108,6 +144,7 @@ db.exec(`
     title TEXT NOT NULL,
     artist TEXT NOT NULL,
     album TEXT,
+    album_key TEXT,
     artist_mbid TEXT,
     album_mbid TEXT,
     track_mbid TEXT,
@@ -120,6 +157,18 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_play_events_user_played_at
     ON play_events(user_id, played_at DESC);
+
+  CREATE TABLE IF NOT EXISTS play_album_stats (
+    user_id INTEGER NOT NULL,
+    album_key TEXT NOT NULL,
+    play_count INTEGER NOT NULL DEFAULT 0,
+    last_played_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, album_key),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_play_album_stats_user_ranking
+    ON play_album_stats(user_id, play_count DESC, last_played_at DESC);
 
   CREATE TABLE IF NOT EXISTS playlist_download_jobs (
     id TEXT PRIMARY KEY,
@@ -137,6 +186,7 @@ db.exec(`
     album_track_titles TEXT,
     artist_aliases TEXT,
     playlist_id TEXT NOT NULL,
+    playlist_generation INTEGER NOT NULL DEFAULT 0,
     playlist_type TEXT,
     status TEXT NOT NULL,
     staging_path TEXT,
@@ -164,8 +214,41 @@ db.exec(`
     quality_bit_depth INTEGER,
     quality_checked_at INTEGER,
     quality_upgrade_checked_at INTEGER,
-    upgrade_for_job_id TEXT
+    upgrade_for_job_id TEXT,
+    manual_replacement_search INTEGER NOT NULL DEFAULT 0,
+    album_grab_attempted INTEGER NOT NULL DEFAULT 0
   );
+
+  CREATE TABLE IF NOT EXISTS weekly_flow_download_cancellations (
+    playlist_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'active',
+    changed_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS weekly_flow_download_job_cancellations (
+    job_id TEXT PRIMARY KEY,
+    cancelled_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_weekly_flow_download_job_cancellations_time
+    ON weekly_flow_download_job_cancellations(cancelled_at);
+
+  CREATE TABLE IF NOT EXISTS weekly_flow_download_provider_work (
+    job_id TEXT NOT NULL,
+    playlist_id TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL,
+    work_id TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (job_id, provider, work_id, username)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_weekly_flow_download_provider_work_job
+    ON weekly_flow_download_provider_work(job_id, provider);
+
+  CREATE INDEX IF NOT EXISTS idx_weekly_flow_download_provider_work_playlist
+    ON weekly_flow_download_provider_work(playlist_id, provider);
 
   CREATE TABLE IF NOT EXISTS deezer_mbid_cache (
     cache_key TEXT PRIMARY KEY,
@@ -214,6 +297,22 @@ db.exec(`
     metadata_json TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    FOREIGN KEY (artist_id) REFERENCES library_artists(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS library_release_calendar (
+    release_group_mbid TEXT NOT NULL,
+    artist_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    release_date TEXT NOT NULL,
+    release_type TEXT,
+    secondary_types_json TEXT,
+    release_statuses_json TEXT,
+    present INTEGER NOT NULL DEFAULT 1,
+    refreshed_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (release_group_mbid, artist_id),
     FOREIGN KEY (artist_id) REFERENCES library_artists(id) ON DELETE CASCADE
   );
 
@@ -283,6 +382,10 @@ db.exec(`
     ON library_albums (title COLLATE NOCASE);
   CREATE INDEX IF NOT EXISTS idx_library_albums_release_date
     ON library_albums (release_date DESC);
+  CREATE INDEX IF NOT EXISTS idx_library_release_calendar_artist
+    ON library_release_calendar (artist_id);
+  CREATE INDEX IF NOT EXISTS idx_library_release_calendar_date
+    ON library_release_calendar (present, release_date DESC);
   CREATE INDEX IF NOT EXISTS idx_library_artists_sort_name_name
     ON library_artists (sort_name COLLATE NOCASE, name COLLATE NOCASE);
   CREATE INDEX IF NOT EXISTS idx_library_artists_mbid
@@ -297,6 +400,8 @@ db.exec(`
     ON library_album_tracks (track_id);
   CREATE INDEX IF NOT EXISTS idx_library_tracks_title
     ON library_tracks (title COLLATE NOCASE);
+  CREATE INDEX IF NOT EXISTS idx_library_tracks_mbid
+    ON library_tracks (mbid);
   CREATE INDEX IF NOT EXISTS idx_library_media_files_track_id
     ON library_media_files (track_id);
   CREATE INDEX IF NOT EXISTS idx_library_media_files_track_source_available
@@ -386,6 +491,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
   CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
   CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_user_identities_provider_subject ON user_identities(provider_type, provider_key, subject);
+  CREATE INDEX IF NOT EXISTS idx_user_identities_user_id ON user_identities(user_id);
   CREATE INDEX IF NOT EXISTS idx_subsonic_stars_user_created
     ON subsonic_stars (user_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_aurral_history_created_at ON aurral_history(created_at DESC);
@@ -399,6 +506,134 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_honker_task_runs_queue_started ON honker_task_runs(queue, started_at DESC);
   CREATE INDEX IF NOT EXISTS idx_honker_task_runs_job ON honker_task_runs(job_id, queue);
 `);
+
+tryAddColumn("ALTER TABLE play_events ADD COLUMN album_key TEXT");
+
+db.transaction(() => {
+  const columns = db.prepare("PRAGMA table_info(play_album_stats)").all().map((column) => column.name);
+  if (!columns.includes("album_key")) {
+    db.exec("DROP TRIGGER IF EXISTS play_events_album_stats_insert; DROP TABLE play_album_stats;");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS play_album_stats (
+      user_id INTEGER NOT NULL,
+      album_key TEXT NOT NULL,
+      play_count INTEGER NOT NULL DEFAULT 0,
+      last_played_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, album_key),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_play_album_stats_user_ranking
+      ON play_album_stats(user_id, play_count DESC, last_played_at DESC);
+    CREATE TRIGGER IF NOT EXISTS play_events_album_stats_insert
+      AFTER INSERT ON play_events
+      WHEN NEW.album_key IS NOT NULL AND TRIM(NEW.album_key) != ''
+    BEGIN
+      INSERT INTO play_album_stats
+        (user_id, album_key, play_count, last_played_at)
+      VALUES (NEW.user_id, NEW.album_key, 1, NEW.played_at)
+      ON CONFLICT(user_id, album_key) DO UPDATE SET
+        play_count = play_album_stats.play_count + 1,
+        last_played_at = MAX(play_album_stats.last_played_at, excluded.last_played_at);
+    END;
+  `);
+}).immediate();
+
+const playAlbumStatsMigrationKey = "migration:play-album-stats-v2";
+db.transaction(() => {
+  const claimed = db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)")
+    .run(playAlbumStatsMigrationKey, "1");
+  if (claimed.changes === 0) return;
+  db.exec(`
+    UPDATE play_events AS event
+    SET album_key = (
+      SELECT MIN(album.identity_key)
+      FROM library_albums AS album
+      JOIN library_artists AS artist ON artist.id = album.artist_id
+      WHERE (
+        event.album_mbid IS NOT NULL
+        AND TRIM(event.album_mbid) != ''
+        AND event.album_mbid IN (
+          album.identity_key,
+          COALESCE(album.mbid, ''),
+          COALESCE(album.release_group_mbid, ''),
+          CAST(album.id AS TEXT)
+        )
+      ) OR (
+        (event.album_mbid IS NULL OR TRIM(event.album_mbid) = '')
+        AND event.album = album.title COLLATE NOCASE
+        AND (
+          event.artist = artist.name COLLATE NOCASE
+          OR event.artist = album.album_artist COLLATE NOCASE
+        )
+      )
+      HAVING COUNT(*) = 1
+    )
+    WHERE album_key IS NULL;
+
+    DELETE FROM play_album_stats;
+    INSERT INTO play_album_stats
+      (user_id, album_key, play_count, last_played_at)
+    SELECT user_id, album_key, COUNT(*), MAX(played_at)
+    FROM play_events
+    WHERE album_key IS NOT NULL AND TRIM(album_key) != ''
+    GROUP BY user_id, album_key;
+  `);
+}).immediate();
+
+const releaseCalendarPrimaryKey = db
+  .prepare("PRAGMA table_info(library_release_calendar)")
+  .all()
+  .filter((column) => Number(column.pk) > 0)
+  .sort((left, right) => Number(left.pk) - Number(right.pk))
+  .map((column) => column.name);
+
+if (JSON.stringify(releaseCalendarPrimaryKey) !== JSON.stringify(["release_group_mbid", "artist_id"])) {
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE library_release_calendar_v2 (
+        release_group_mbid TEXT NOT NULL,
+        artist_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        release_date TEXT NOT NULL,
+        release_type TEXT,
+        secondary_types_json TEXT,
+        release_statuses_json TEXT,
+        present INTEGER NOT NULL DEFAULT 1,
+        refreshed_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (release_group_mbid, artist_id),
+        FOREIGN KEY (artist_id) REFERENCES library_artists(id) ON DELETE CASCADE
+      );
+
+      INSERT INTO library_release_calendar_v2
+        (release_group_mbid, artist_id, title, release_date, release_type,
+         secondary_types_json, release_statuses_json, present, refreshed_at, created_at, updated_at)
+      SELECT release_group_mbid, artist_id, title, release_date, release_type,
+        secondary_types_json, release_statuses_json, present, refreshed_at, created_at, updated_at
+      FROM library_release_calendar;
+
+      DROP TABLE library_release_calendar;
+      ALTER TABLE library_release_calendar_v2 RENAME TO library_release_calendar;
+      CREATE INDEX idx_library_release_calendar_artist
+        ON library_release_calendar (artist_id);
+      CREATE INDEX idx_library_release_calendar_date
+        ON library_release_calendar (present, release_date DESC);
+    `);
+  })();
+}
+
+// The previous getIndexes timestamp was the request time. Seed existing users past that value
+// so a client carrying a pre-upgrade ifModifiedSince receives the new index once.
+db.prepare(`
+  INSERT OR IGNORE INTO subsonic_star_changes (user_id, changed_at)
+  SELECT users.id,
+         MAX(?, COALESCE((
+           SELECT MAX(created_at) FROM subsonic_stars WHERE user_id = users.id
+         ), 0))
+  FROM users
+`).run(Date.now() + 1);
 
 tryAddColumn("ALTER TABLE library_media_files ADD COLUMN album_id INTEGER");
 tryAddColumn("ALTER TABLE images_cache ADD COLUMN images_json TEXT");
@@ -476,48 +711,18 @@ db.exec(`
     ON library_media_files (track_id, album_id, source, available, created_at DESC);
 `);
 
-const duplicateLidarrArtistIds = db
-  .prepare(
-    `SELECT lidarr_foreign_artist_id
-     FROM lidarr_artist_id_map
-     GROUP BY lidarr_foreign_artist_id
-     HAVING COUNT(*) > 1`,
-  )
-  .all();
-
-if (duplicateLidarrArtistIds.length > 0) {
-  const deleteDuplicateLidarrArtistId = db.prepare(
-    `DELETE FROM lidarr_artist_id_map
-     WHERE lidarr_foreign_artist_id = ?
-       AND musicbrainz_id NOT IN (
-         SELECT musicbrainz_id
-         FROM lidarr_artist_id_map
-         WHERE lidarr_foreign_artist_id = ?
-         ORDER BY updated_at DESC, musicbrainz_id ASC
-         LIMIT 1
-       )`,
-  );
-  db.transaction((duplicates) => {
-    for (const duplicate of duplicates) {
-      deleteDuplicateLidarrArtistId.run(
-        duplicate.lidarr_foreign_artist_id,
-        duplicate.lidarr_foreign_artist_id,
-      );
-    }
-  })(duplicateLidarrArtistIds);
-}
-
-db.exec(`
-  DROP INDEX IF EXISTS idx_lidarr_artist_id_map_foreign_id;
-  CREATE UNIQUE INDEX idx_lidarr_artist_id_map_foreign_id
-    ON lidarr_artist_id_map (lidarr_foreign_artist_id);
-`);
+ensureUniqueLidarrArtistIdIndex(db);
 
 const tableColumns = db
   .prepare("PRAGMA table_info(playlist_download_jobs)")
   .all()
   .map((column) => column.name);
 
+if (!tableColumns.includes("playlist_generation")) {
+  tryAddColumn(
+    "ALTER TABLE playlist_download_jobs ADD COLUMN playlist_generation INTEGER NOT NULL DEFAULT 0",
+  );
+}
 if (!tableColumns.includes("album_name")) {
   tryAddColumn("ALTER TABLE playlist_download_jobs ADD COLUMN album_name TEXT");
 }
@@ -554,10 +759,20 @@ for (const [name, type] of [
   ["quality_checked_at", "INTEGER"],
   ["quality_upgrade_checked_at", "INTEGER"],
   ["upgrade_for_job_id", "TEXT"],
+  ["manual_replacement_search", "INTEGER NOT NULL DEFAULT 0"],
+  ["album_grab_attempted", "INTEGER NOT NULL DEFAULT 0"],
 ]) {
   if (!tableColumns.includes(name)) {
     tryAddColumn(`ALTER TABLE playlist_download_jobs ADD COLUMN ${name} ${type}`);
   }
+}
+
+const sessionColumns = db
+  .prepare("PRAGMA table_info(sessions)")
+  .all()
+  .map((column) => column.name);
+if (!sessionColumns.includes("reauthenticated_at")) {
+  tryAddColumn("ALTER TABLE sessions ADD COLUMN reauthenticated_at INTEGER");
 }
 
 const userColumns = db
@@ -586,6 +801,59 @@ if (!userColumns.includes("discover_layout")) {
 if (!userColumns.includes("listen_history_url")) {
   tryAddColumn("ALTER TABLE users ADD COLUMN listen_history_url TEXT");
 }
+if (!userColumns.includes("status")) {
+  tryAddColumn("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+}
+if (!userColumns.includes("is_protected")) {
+  db.transaction(() => {
+    tryAddColumn("ALTER TABLE users ADD COLUMN is_protected INTEGER NOT NULL DEFAULT 0");
+    const integrationsRow = db.prepare("SELECT value FROM settings WHERE key = 'integrations'").get();
+    let integrations = null;
+    try {
+      integrations = JSON.parse(integrationsRow?.value || "null");
+    } catch {
+      integrations = null;
+    }
+    const legacyUsername = String(integrations?.general?.authUser || "admin").trim();
+    if (legacyUsername && integrations?.general?.authPassword) {
+      db.prepare(
+        "UPDATE users SET is_protected = 1 WHERE LOWER(username) = LOWER(?) AND role = 'admin'",
+      ).run(legacyUsername);
+    }
+  })();
+}
+if (!userColumns.includes("role_source")) {
+  tryAddColumn("ALTER TABLE users ADD COLUMN role_source TEXT NOT NULL DEFAULT 'local'");
+}
+if (!userColumns.includes("has_local_password")) {
+  db.transaction(() => {
+    tryAddColumn("ALTER TABLE users ADD COLUMN has_local_password INTEGER NOT NULL DEFAULT 0");
+    // Old rows cannot reliably distinguish local passwords from random hashes
+    // generated for external users. Expire sessions so the next successful
+    // local login can prove and record that a usable password exists.
+    db.exec("DELETE FROM sessions");
+  })();
+}
+if (!userColumns.includes("needs_identity_migration")) {
+  db.transaction(() => {
+    tryAddColumn(
+      "ALTER TABLE users ADD COLUMN needs_identity_migration INTEGER NOT NULL DEFAULT 0",
+    );
+    db.exec(`
+      UPDATE users SET needs_identity_migration = 1
+      WHERE id NOT IN (SELECT DISTINCT user_id FROM user_identities)
+    `);
+  })();
+}
+if (!userColumns.includes("allow_identity_adoption")) {
+  tryAddColumn("ALTER TABLE users ADD COLUMN allow_identity_adoption INTEGER NOT NULL DEFAULT 0");
+}
+
+db.exec(`
+  UPDATE users SET needs_identity_migration = 0, allow_identity_adoption = 0
+  WHERE needs_identity_migration = 1
+    AND id IN (SELECT DISTINCT user_id FROM user_identities)
+`);
 if (!userColumns.includes("default_library_owner")) {
   tryAddColumn("ALTER TABLE users ADD COLUMN default_library_owner TEXT");
 }
@@ -630,6 +898,41 @@ export const dbHelpers = {
 };
 
 initializeSchemaOnStartup(db, dbHelpers);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS playlist_download_jobs_revision (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL DEFAULT 0
+  );
+  INSERT OR IGNORE INTO playlist_download_jobs_revision (id, revision) VALUES (1, 0);
+  CREATE TRIGGER IF NOT EXISTS playlist_download_jobs_revision_insert
+    AFTER INSERT ON playlist_download_jobs BEGIN
+      UPDATE playlist_download_jobs_revision SET revision = revision + 1 WHERE id = 1;
+    END;
+  CREATE TRIGGER IF NOT EXISTS playlist_download_jobs_revision_update
+    AFTER UPDATE ON playlist_download_jobs BEGIN
+      UPDATE playlist_download_jobs_revision SET revision = revision + 1 WHERE id = 1;
+    END;
+  CREATE TRIGGER IF NOT EXISTS playlist_download_jobs_revision_delete
+    AFTER DELETE ON playlist_download_jobs BEGIN
+      UPDATE playlist_download_jobs_revision SET revision = revision + 1 WHERE id = 1;
+    END;
+`);
+db.exec(`
+  CREATE TRIGGER IF NOT EXISTS playlist_download_attempt_delete
+    AFTER DELETE ON playlist_download_jobs BEGIN
+      DELETE FROM settings WHERE key = 'activeDownloadAttempt:' || OLD.id;
+    END;
+  CREATE TRIGGER IF NOT EXISTS playlist_download_attempt_complete
+    AFTER UPDATE OF status ON playlist_download_jobs WHEN NEW.status = 'done' BEGIN
+      DELETE FROM settings WHERE key = 'activeDownloadAttempt:' || NEW.id;
+    END;
+  DELETE FROM settings WHERE key LIKE 'activeDownloadAttempt:%'
+    AND NOT EXISTS (
+      SELECT 1 FROM playlist_download_jobs
+      WHERE id = substr(settings.key, length('activeDownloadAttempt:') + 1) AND status != 'done'
+    );
+`);
 initializeLibrarySearchIndex(db);
 
 const existingDownloadFolder = db

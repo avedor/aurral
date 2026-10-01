@@ -64,6 +64,31 @@ export const getFlowJobs = (flowId, limit = null, options = {}) => {
 export const getAllFlowJobs = (options = {}) =>
   getData("/playlists/jobs", options);
 
+export const getFlowJobFiles = (jobId, options = {}) =>
+  getData(`/playlists/jobs/${encodeURIComponent(jobId)}/files`, options);
+
+export const getManualMissingSearchSources = (jobId, { mode = "missing", playlistId = null } = {}) =>
+  getData(`/playlists/jobs/${encodeURIComponent(jobId)}/manual-search/sources`, {
+    params: { mode, ...(playlistId ? { playlistId } : {}) },
+  });
+
+export const searchMissingTrackManually = (
+  jobId,
+  sourceId,
+  { mode = "missing", playlistId = null } = {},
+) =>
+  postData(
+    `/playlists/jobs/${encodeURIComponent(jobId)}/manual-search`,
+    { sourceId, mode, ...(playlistId ? { playlistId } : {}) },
+    { timeout: 150_000 },
+  );
+
+export const downloadManualMissingSearchResult = (jobId, sessionId, resultId) =>
+  postData(
+    `/playlists/jobs/${encodeURIComponent(jobId)}/manual-search/select`,
+    { sessionId, resultId },
+  );
+
 export const reSearchAllMissingTracks = () =>
   postData("/playlists/research-missing");
 
@@ -103,6 +128,9 @@ export const updateSharedPlaylist = (playlistId, payload) =>
 export const setPlaylistTrackAvailability = (playlistId, enabled) =>
   putData(`/playlists/shared-playlists/${encodeURIComponent(playlistId)}/track-availability`, { enabled });
 
+export const setPlaylistRecordHistory = (playlistId, enabled) =>
+  putData(`/playlists/shared-playlists/${encodeURIComponent(playlistId)}/record-history`, { enabled });
+
 export const addSharedPlaylistTracks = (playlistId, payload) =>
   postData(
     `/playlists/shared-playlists/${playlistId}/tracks`,
@@ -129,18 +157,10 @@ export const reSearchFlowTrack = (playlistId, jobId) =>
     `/playlists/flows/${encodeURIComponent(playlistId)}/tracks/${encodeURIComponent(jobId)}/research`,
   );
 
-export const reSearchMissingSharedPlaylistTracks = (playlistId) =>
-  postData(
-    `/playlists/shared-playlists/${playlistId}/research-missing`,
-  );
-
 export const searchTrackUpgrade = (playlistId, jobId) =>
   postData(
     `/playlists/quality-upgrades/${encodeURIComponent(playlistId)}/${encodeURIComponent(jobId)}`,
   );
-
-export const searchPlaylistUpgrades = (playlistId) =>
-  postData(`/playlists/quality-upgrades/${encodeURIComponent(playlistId)}`);
 
 export const searchAllUpgrades = () => postData("/playlists/quality-upgrades");
 
@@ -199,8 +219,25 @@ export const previewLastfmPlaylist = (playlistId, username = "") =>
 export const importLastfmPlaylist = (payload) =>
   postData("/playlists/import/lastfm", payload);
 
+export const previewYoutubeMusicPlaylist = (url) =>
+  postData("/playlists/import/youtube-music/preview", { url }, { timeout: 5 * 60 * 1000 });
+
+export const importYoutubeMusicPlaylist = (payload) =>
+  postData("/playlists/import/youtube-music", payload, { timeout: 5 * 60 * 1000 });
+
 export const syncSharedPlaylistImport = (playlistId) =>
-  postData(`/playlists/shared-playlists/${encodeURIComponent(playlistId)}/sync`);
+  postData(`/playlists/shared-playlists/${encodeURIComponent(playlistId)}/sync`, undefined, {
+    timeout: 5 * 60 * 1000,
+  });
 
 export const getFlowLidarrImportListUrl = (flowId) =>
   getData(`/playlists/flows/${encodeURIComponent(flowId)}/lidarr-import-list`);
+
+export const removeSharedPlaylistTracks = (playlistId, jobIds) =>
+  postData(`/playlists/shared-playlists/${encodeURIComponent(playlistId)}/track-removals`, { jobIds });
+
+export const moveSharedPlaylistTracks = (playlistId, jobIds, target) =>
+  postData(`/playlists/shared-playlists/${encodeURIComponent(playlistId)}/track-moves`, { jobIds, target });
+
+export const getSharedPlaylistOperation = (playlistId, operationId, options) =>
+  getData(`/playlists/shared-playlists/${encodeURIComponent(playlistId)}/operations/${encodeURIComponent(operationId)}`, options);

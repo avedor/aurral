@@ -9,6 +9,13 @@ import {
 } from "../../../services/albumSearchState.js";
 import { logger } from "../../../services/logger.js";
 import { getCanonicalTrackOwnership } from "../../../services/libraryQueryService.js";
+import { resolveAurralOwnedTrackJob } from "../../../services/libraryTrackResearchService.js";
+import { weeklyFlowOperationQueue } from "../../../services/weeklyFlow/weeklyFlowOperationQueue.js";
+import { downloadTracker } from "../../../services/weeklyFlow/weeklyFlowDownloadTracker.js";
+import {
+  getDownloadSourceNotConfiguredMessage,
+  isAnyDownloadSourceConfigured,
+} from "../../../services/downloadSourceService.js";
 
 const STALE_GRABBED_MS = 15 * 60 * 1000;
 const ACTIVE_STATUS_CACHE_MS = 10 * 1000;
@@ -18,6 +25,7 @@ let allDownloadStatusesCache = {
   snapshot: null,
   pending: null,
   failures: 0,
+  checkedAt: 0,
   nextRefreshAt: 0,
   revision: 0,
 };
@@ -286,14 +294,19 @@ const staleSnapshot = (error) => ({
   error: error?.message || String(error),
 });
 
-export const getLidarrStatusSnapshot = async ({ force = false } = {}) => {
+export const getLidarrStatusSnapshot = async ({ refresh = false } = {}) => {
   const { lidarrClient } = await import("../../../services/lidarrClient.js");
   if (lidarrClient.isCircuitOpen()) {
     return staleSnapshot("Lidarr circuit is open");
   }
 
   const now = Date.now();
-  if (!force && allDownloadStatusesCache.snapshot && now < allDownloadStatusesCache.nextRefreshAt) {
+  const maxAgeMs = refresh ? ACTIVE_STATUS_CACHE_MS : Infinity;
+  if (
+    allDownloadStatusesCache.snapshot &&
+    now < allDownloadStatusesCache.nextRefreshAt &&
+    now - allDownloadStatusesCache.checkedAt < maxAgeMs
+  ) {
     return allDownloadStatusesCache.snapshot;
   }
   if (allDownloadStatusesCache.pending) {
@@ -314,6 +327,7 @@ export const getLidarrStatusSnapshot = async ({ force = false } = {}) => {
         error: null,
       };
       allDownloadStatusesCache.snapshot = snapshot;
+      allDownloadStatusesCache.checkedAt = refreshedAt;
       allDownloadStatusesCache.failures = 0;
       allDownloadStatusesCache.nextRefreshAt =
         refreshRevision === allDownloadStatusesCache.revision
@@ -323,7 +337,8 @@ export const getLidarrStatusSnapshot = async ({ force = false } = {}) => {
     })
     .catch((error) => {
       allDownloadStatusesCache.failures += 1;
-      const retryAt = Date.now() + Math.min(
+      allDownloadStatusesCache.checkedAt = Date.now();
+      const retryAt = allDownloadStatusesCache.checkedAt + Math.min(
         MAX_STATUS_RETRY_MS,
         ACTIVE_STATUS_CACHE_MS * 2 ** (allDownloadStatusesCache.failures - 1),
       );
@@ -345,6 +360,49 @@ export const getAllDownloadStatuses = async () =>
   (await getLidarrStatusSnapshot()).statuses;
 
 export function registerDownloads(router) {
+  router.post(
+    "/downloads/tracks/:trackId/research",
+    requireAuth,
+    requirePermission("addAlbum"),
+    async (req, res) => {
+      const trackId = Number(req.params.trackId);
+      const albumId = req.body?.albumId;
+      const sourceJob = resolveAurralOwnedTrackJob({ trackId, albumId });
+      if (!sourceJob) {
+        return res.status(404).json({
+          error: "Track is not an available Aurral-managed library track",
+        });
+      }
+      if (!isAnyDownloadSourceConfigured()) {
+        const message = getDownloadSourceNotConfiguredMessage();
+        return res.status(400).json({ error: message, message });
+      }
+      if (downloadTracker.findActiveUpgradeJob(sourceJob)) {
+        return res.status(409).json({ error: "A search for this track is already running" });
+      }
+
+      try {
+        const result = await weeklyFlowOperationQueue.enqueuePayload({
+          kind: "library-track-research",
+          label: `library-track-research:${trackId}:${albumId || "all"}`,
+          trackId,
+          albumId,
+        });
+        return res.status(202).json({
+          success: true,
+          queued: true,
+          operationId: result.operationId,
+        });
+      } catch (error) {
+        logger.error("library", "Failed to queue track replacement search", error.message);
+        return res.status(500).json({
+          error: "Failed to queue track replacement search",
+          message: error.message,
+        });
+      }
+    },
+  );
+
   router.post("/downloads/track", requireAuth, requirePermission("addAlbum"), async (req, res) => {
     const body = req.body || {};
     const track = {
@@ -463,12 +521,14 @@ export function registerDownloads(router) {
         return res.status(400).json({ error: "Lidarr is not configured" });
       }
 
-      const album = await libraryManager.getAlbumById(albumId);
+      const album = await libraryManager.getAlbumById(albumId, { managedBy: "lidarr" });
       if (!album) {
         return res.status(404).json({ error: "Album not found" });
       }
 
-      const artist = album.artistId ? await libraryManager.getArtistById(album.artistId) : null;
+      const artist = album.artistId
+        ? await libraryManager.getArtistById(album.artistId, { managedBy: "lidarr" })
+        : null;
       if (artist) {
         await libraryManager.ensureArtistMonitored(artist);
       }
@@ -529,12 +589,14 @@ export function registerDownloads(router) {
           return res.status(400).json({ error: "Lidarr is not configured" });
         }
 
-        const album = await libraryManager.getAlbumById(albumId);
+        const album = await libraryManager.getAlbumById(albumId, { managedBy: "lidarr" });
         if (!album) {
           return res.status(404).json({ error: "Album not found" });
         }
 
-        const artist = album.artistId ? await libraryManager.getArtistById(album.artistId) : null;
+        const artist = album.artistId
+          ? await libraryManager.getArtistById(album.artistId, { managedBy: "lidarr" })
+          : null;
         if (artist) {
           await libraryManager.ensureArtistMonitored(artist);
         }
@@ -614,7 +676,15 @@ export function registerDownloads(router) {
         return res.status(400).json({ error: "albumIds query parameter is required" });
       }
       const albumIdArray = Array.isArray(albumIds) ? albumIds : albumIds.split(",");
-      const statuses = await getDownloadStatusesForAlbumIds(albumIdArray);
+      const aurralPrefix = "aurral:";
+      const aurralIds = albumIdArray.filter((id) => String(id).startsWith(aurralPrefix));
+      const statuses = await getDownloadStatusesForAlbumIds(
+        albumIdArray.filter((id) => !String(id).startsWith(aurralPrefix)),
+      );
+      for (const key of aurralIds) {
+        const status = libraryManager.getAurralAlbumStatus(key.slice(aurralPrefix.length));
+        if (!status?.error) statuses[key] = status;
+      }
       res.json(statuses);
     } catch (error) {
       res.status(500).json({

@@ -1,5 +1,8 @@
+import { acquireReleaseMetadataLease } from "./releaseMetadataLease.js";
 import createHonkerWorker from "./honkerWorkerFactory.js";
 import {
+  getInboxTaskQueue,
+  getMaintenanceTaskQueue,
   getSystemTaskQueue,
   PLAYLIST_STARTUP_MIGRATION_SETTING,
   PLAYLIST_STARTUP_MIGRATION_VERSION,
@@ -8,12 +11,22 @@ import { cleanExpiredSessions } from "../config/session-helpers.js";
 import { dbOps } from "../db/helpers/index.js";
 import { resolvePlaylistRoot } from "./playlistPaths.js";
 
-export async function processSystemTask(payload = {}, job = null) {
+export async function processSystemTask(payload = {}, job = null, context = {}) {
   const kind = String(payload?.kind || "").trim();
   switch (kind) {
     case "weekly-flow-refresh": {
       const { runScheduledRefresh } = await import("./weeklyFlow/weeklyFlowScheduler.js");
       await runScheduledRefresh();
+      return;
+    }
+    case "aurral-monitoring-apply": {
+      const { libraryManager } = await import("./libraryManager.js");
+      await libraryManager.acquireAurralReleases(payload);
+      return;
+    }
+    case "aurral-monitoring-reconcile": {
+      const { libraryManager } = await import("./libraryManager.js");
+      await libraryManager.reconcileAurralMonitoring();
       return;
     }
     case "session-cleanup":
@@ -57,6 +70,15 @@ export async function processSystemTask(payload = {}, job = null) {
     }
     case "library-index-refresh": {
       return;
+    }
+    case "release-metadata-refresh": {
+      const { refreshReleaseMetadata } = await import("./releaseMetadataSync.js");
+      const result = await refreshReleaseMetadata({ signal: context.signal, lease: context.lease });
+      const { websocketService } = await import("./websocketService.js");
+      websocketService.broadcast("library", {
+        type: "release_metadata_refreshed",
+      });
+      return result;
     }
     case "library-index-bootstrap": {
       const { hasCompletedLibraryScan, scheduleLibraryScan } = await import(
@@ -181,6 +203,9 @@ export async function processSystemTask(payload = {}, job = null) {
     case "lidarr-retry": {
       const { libraryManager } = await import("./libraryManager.js");
       await libraryManager.syncLidarrArtists({ forceRefresh: true });
+      if (process.connected && process.send) {
+        process.send({ type: "cache-invalidate", cache: "lidarr-artists" });
+      }
       return;
     }
     default:
@@ -194,6 +219,8 @@ const {
   isRunning: isSystemTaskWorkerRunning,
 } = createHonkerWorker({
   name: "system-task",
+  interruptible: (payload) => payload?.kind === "release-metadata-refresh",
+  prepareJob: prepareSystemTask,
   getQueue: getSystemTaskQueue,
   processJob: processSystemTask,
   idlePollS: 10,
@@ -205,3 +232,32 @@ export {
   stopSystemTaskWorker,
   isSystemTaskWorkerRunning,
 };
+
+const { start: startMaintenanceTaskWorker } = createHonkerWorker({
+  name: "system-task-maintenance",
+  getQueue: getMaintenanceTaskQueue,
+  processJob: processSystemTask,
+  idlePollS: 10,
+  retryDelayS: 120,
+  onJobSuccess(payload) {
+    if (payload?.kind === "news-refresh" && process.connected && process.send) {
+      process.send({ type: "cache-invalidate", cache: "news" });
+    }
+  },
+});
+
+const { start: startInboxTaskWorker } = createHonkerWorker({
+  name: "system-task-inbox",
+  getQueue: getInboxTaskQueue,
+  processJob: processSystemTask,
+  idlePollS: 10,
+  retryDelayS: 120,
+});
+
+export { startMaintenanceTaskWorker, startInboxTaskWorker };
+
+export async function prepareSystemTask(payload, job, { signal }) {
+  if (payload?.kind !== "release-metadata-refresh") return null;
+  const lease = await acquireReleaseMetadataLease({ signal });
+  return { lease, release: () => lease.release() };
+}

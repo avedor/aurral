@@ -9,7 +9,6 @@ import {
   toPipelineCandidate,
   usableEvaluationEntries,
   validateDownloadedTrackFile,
-  MATCHER_UNAVAILABLE_MESSAGE,
 } from "./trackMatching/index.js";
 import { buildYtdlpSearchQueries } from "./weeklyFlow/weeklyFlowYtdlpSearch.js";
 import { resolvePlaylistRoot } from "./playlistPaths.js";
@@ -20,6 +19,7 @@ import {
   sanitizePathPart,
   writeAudioMetadata,
 } from "./playlistDownloadUtils.js";
+import { deferForInactiveOwner } from "./weeklyFlow/weeklyFlowOwnerStatus.js";
 import {
   getPayloadCandidate,
   hasNextCandidate,
@@ -28,6 +28,10 @@ import {
   blockPipelineJobForReview,
   finalizePipelineJobSuccess,
 } from "./pipelineHelpers.js";
+import {
+  isPipelinePayloadActive,
+  withPipelineCommitLock,
+} from "./weeklyFlow/weeklyFlowDownloadCancellation.js";
 
 const ytdlpClient = getDownloadClient("ytdlp");
 const LIVE_STATUSES = new Set(["is_live", "was_live", "post_live", "is_upcoming"]);
@@ -65,6 +69,11 @@ async function handleYtdlpSearch(payload, helpers) {
     upgradeForJobId: payload.upgradeForJobId || null,
   };
   const queries = buildYtdlpSearchQueries(resolvedTrack);
+  const deniedIds = new Set(
+    (Array.isArray(job.deniedRemoteSources) ? job.deniedRemoteSources : [])
+      .filter((entry) => Array.isArray(entry) && entry[0] === "ytdlp")
+      .map((entry) => String(entry[1] || "").trim()),
+  );
   const aggregated = [];
   const seen = new Set();
   let lastError = "";
@@ -72,7 +81,7 @@ async function handleYtdlpSearch(payload, helpers) {
     if (hasEnoughCandidates(aggregated, resolvedTrack)) break;
     try {
       const results = await ytdlpClient.search(query, { limit: 5 });
-      mergeSearchResults(aggregated, seen, results, (entry) =>
+      mergeSearchResults(aggregated, seen, results.filter((entry) => !deniedIds.has(String(entry.id || "").trim())), (entry) =>
         String(entry.id || entry.url || "").trim().toLowerCase(),
       );
     } catch (error) {
@@ -94,17 +103,6 @@ async function handleYtdlpSearch(payload, helpers) {
     results: downloadableResults,
     request: resolvedTrack,
   });
-  if (evaluation.decision === "error") {
-    return helpers.failOrTryNextSource(payload, job, MATCHER_UNAVAILABLE_MESSAGE, {
-      queryCount: queries.length,
-      rawResultCount: aggregated.length,
-    });
-  }
-  const deniedIds = new Set(
-    (Array.isArray(job.deniedRemoteSources) ? job.deniedRemoteSources : [])
-      .filter((entry) => Array.isArray(entry) && entry[0] === "ytdlp")
-      .map((entry) => String(entry[1] || "").trim()),
-  );
   const candidates = usableEvaluationEntries(evaluation)
     .filter((entry) => !deniedIds.has(String(entry.candidate?.provider?.id || "").trim()))
     .map(toPipelineCandidate);
@@ -148,8 +146,15 @@ async function handleYtdlpDownload(payload, helpers) {
 
   let downloaded;
   try {
-    downloaded = await ytdlpClient.downloadAudio(url, { jobId: job.id });
+    downloaded = await ytdlpClient.downloadAudio(url, {
+      jobId: job.id,
+      shouldCancel: () => !isPipelinePayloadActive(payload),
+    });
   } catch (error) {
+    if (!isPipelinePayloadActive(payload)) {
+      await ytdlpClient.cleanupStaging(job.id);
+      return null;
+    }
     const message = error?.message || String(error);
     logger.warn("ytdlp", "yt-dlp download failed", {
       jobId: job.id,
@@ -160,6 +165,11 @@ async function handleYtdlpDownload(payload, helpers) {
       return buildNextCandidatePayload(payload, { downloadedPath: null });
     }
     return helpers.failOrTryNextSource(payload, job, message);
+  }
+
+  if (!isPipelinePayloadActive(payload)) {
+    await ytdlpClient.cleanupStaging(job.id);
+    return null;
   }
 
   downloadTracker.updateDownloadMetadata(job.id, {
@@ -205,8 +215,13 @@ async function handleYtdlpFinalize(payload, helpers) {
     source: "ytdlp",
     options: {
       strict: candidate?.evaluation?.decision !== "accept",
+      manualSelection: payload.manualSelection === true,
     },
   });
+  if (!isPipelinePayloadActive(payload)) {
+    await ytdlpClient.cleanupStaging(job.id);
+    return null;
+  }
   if (!validation.valid) {
     if (
       validation.blocked &&
@@ -228,27 +243,36 @@ async function handleYtdlpFinalize(payload, helpers) {
     return helpers.failOrTryNextSource(payload, job, reason);
   }
 
-  await writeAudioMetadata(filePath, resolvedTrack);
-  import("./aurralHistoryService.js")
-    .then(({ recordTrackJobMoving }) => recordTrackJobMoving(job))
-    .catch((err) => {
-      console.warn(err);
-    });
+  const inactiveOwner = deferForInactiveOwner(payload, job);
+  if (inactiveOwner) return inactiveOwner;
   const playlistRoot = resolvePlaylistRoot();
   const destination = String(payload.destination || "").trim();
   const ext = path.extname(filePath).toLowerCase();
   const finalDir = joinUnderRoot(playlistRoot, destination);
   const finalName = `${sanitizePathPart(job.trackName, "Unknown Track")}${ext || ".m4a"}`;
   const finalPath = path.join(finalDir, finalName);
-  const committedFinalPath = await commitImportToPlaylistLibrary(filePath, finalPath);
-  await ytdlpClient.cleanupStaging(job.id);
-  return finalizePipelineJobSuccess({
-    downloadTracker,
-    job,
-    committedFinalPath,
-    album: candidate?.resolvedAlbumName || job.albumName,
-    quality: validation.quality,
+  const committed = await withPipelineCommitLock(payload, async () => {
+    await writeAudioMetadata(filePath, resolvedTrack);
+    import("./aurralHistoryService.js")
+      .then(({ recordTrackJobMoving }) => recordTrackJobMoving(job))
+      .catch((err) => {
+        console.warn(err);
+      });
+    const committedFinalPath = await commitImportToPlaylistLibrary(filePath, finalPath);
+    await ytdlpClient.cleanupStaging(job.id);
+    return finalizePipelineJobSuccess({
+      downloadTracker,
+      job,
+      committedFinalPath,
+      album: candidate?.resolvedAlbumName || job.albumName,
+      quality: validation.quality,
+    });
   });
+  if (committed.cancelled) {
+    await ytdlpClient.cleanupStaging(job.id);
+    return null;
+  }
+  return committed.result;
 }
 
 export async function processYtdlpPipelinePayload(payload, helpers = {}) {
@@ -257,6 +281,10 @@ export async function processYtdlpPipelinePayload(payload, helpers = {}) {
     jobId: payload.jobId,
     source: payload.source,
   });
+  if (!isPipelinePayloadActive(payload)) {
+    await ytdlpClient.cleanupStaging(payload.jobId);
+    return null;
+  }
   switch (payload.phase) {
     case "search":
       return handleYtdlpSearch(payload, helpers);

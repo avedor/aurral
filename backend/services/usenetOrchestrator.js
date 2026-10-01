@@ -12,7 +12,6 @@ import {
 } from "./weeklyFlow/weeklyFlowUsenetReleaseSearch.js";
 import {
   selectVerifiedDownloadedFile,
-  MATCHER_UNAVAILABLE_MESSAGE,
 } from "./trackMatching/index.js";
 import { resolvePlaylistRoot } from "./playlistPaths.js";
 import { getPathMappings, resolveLocalPath } from "./pathMappings.js";
@@ -23,6 +22,7 @@ import {
   sanitizePathPart,
   writeAudioMetadata,
 } from "./playlistDownloadUtils.js";
+import { deferForInactiveOwner } from "./weeklyFlow/weeklyFlowOwnerStatus.js";
 import {
   getPayloadCandidate,
   hasNextCandidate,
@@ -31,31 +31,55 @@ import {
   blockPipelineJobForReview,
   finalizePipelineJobSuccess,
 } from "./pipelineHelpers.js";
+import {
+  isPipelinePayloadActive,
+  withPipelineCommitLock,
+} from "./weeklyFlow/weeklyFlowDownloadCancellation.js";
 import { getQualityProfile } from "./qualityProfileService.js";
 import { orderAdvertisedQualityCandidates } from "./qualityProfileModel.js";
+import { finishAlbumGrab } from "./albumGrab.js";
 
 const MIN_USENET_CANDIDATES = 2;
 const MAX_DOWNLOAD_CANDIDATES = 5;
 const POLL_DELAY_SECONDS = 5;
 const MAX_POLL_ATTEMPTS = 720;
 
-function getUsenetClient() {
+function getUsenetClient(preferredKey = null) {
+  if (["sabnzbd", "nzbget"].includes(preferredKey)) {
+    return getDownloadClient(preferredKey);
+  }
   const sabnzbd = getDownloadClient("sabnzbd");
   if (sabnzbd.isConfigured()) return sabnzbd;
   return getDownloadClient("nzbget");
 }
 
-function getUsenetClientKey() {
-  return getUsenetClient().key;
+function getUsenetClientKey(preferredKey = null) {
+  return getUsenetClient(preferredKey).key;
 }
 
 function getSabnzbdClient() {
   return getDownloadClient("sabnzbd");
 }
 
-function hasEnoughCandidates(aggregated, resolvedTrack, qualityOptions) {
+function removeSabnzbdItem(nzbId, jobId) {
+  const client = getSabnzbdClient();
+  client.deleteQueueItem(nzbId).catch((error) => {
+    logger.warn("usenet", "Could not remove SABnzbd queue item", {
+      jobId,
+      reason: error?.message || String(error),
+    });
+  });
+  client.deleteHistoryItem(nzbId).catch((error) => {
+    logger.warn("usenet", "Could not remove SABnzbd history item", {
+      jobId,
+      reason: error?.message || String(error),
+    });
+  });
+}
+
+function hasEnoughCandidates(aggregated, resolvedTrack, qualityOptions, albumGrab) {
   const ranked = rankUsenetReleases(aggregated, resolvedTrack).filter(
-    (entry) => entry.releaseAdmissible,
+    (entry) => entry.releaseAdmissible && (!albumGrab || entry.resolvedAlbumName),
   );
   return orderAdvertisedQualityCandidates(ranked, {
     ...qualityOptions,
@@ -119,8 +143,8 @@ function uniqueResolvedPaths(values, source) {
   return out;
 }
 
-export async function collectDownloadedAudioFiles(historyItem) {
-  const clientKey = getUsenetClientKey();
+export async function collectDownloadedAudioFiles(historyItem, preferredClient = null) {
+  const clientKey = getUsenetClientKey(preferredClient);
   const roots = uniqueResolvedPaths([
     historyItem?.FinalDir,
     historyItem?.DestDir,
@@ -143,15 +167,16 @@ export async function collectDownloadedAudioFiles(historyItem) {
   return uniqueResolvedPaths(files, clientKey);
 }
 
-async function validateDownloadedRelease(audioFilePaths, candidate, resolvedTrack) {
+async function validateDownloadedRelease(audioFilePaths, candidate, resolvedTrack, options = {}) {
   // Post-download identity is decided by the shared engine: downloaded files
-  // are assigned to the expected tracklist with beets when one is available
+  // are assigned to the expected tracklist with the native matcher
   // and validated individually against the requested track.
   return selectVerifiedDownloadedFile({
     request: resolvedTrack,
     filePaths: audioFilePaths,
     candidate,
     source: "usenet",
+    options,
   });
 }
 
@@ -179,18 +204,25 @@ async function handleUsenetSearch(payload, helpers) {
     upgrade: payload.upgrade === true,
   };
   const searchTiers = buildFlowSearchTiers(resolvedTrack);
+  const deniedSources = Array.isArray(job.deniedRemoteSources) ? job.deniedRemoteSources : [];
+  const deniedSourceGuidSet = new Set(
+    deniedSources
+      .filter((entry) => Array.isArray(entry) && entry[0] === "usenet")
+      .map((entry) => String(entry[1] || "").trim()),
+  );
   const aggregated = [];
   const seen = new Set();
   const queries = [];
   let lastError = "";
   for (const tier of searchTiers) {
-    if (hasEnoughCandidates(aggregated, resolvedTrack, qualityOptions)) break;
+    if (hasEnoughCandidates(aggregated, resolvedTrack, qualityOptions, payload.albumGrab === true)) break;
     for (const query of tier.queries) {
-      if (hasEnoughCandidates(aggregated, resolvedTrack, qualityOptions)) break;
+      if (hasEnoughCandidates(aggregated, resolvedTrack, qualityOptions, payload.albumGrab === true)) break;
       queries.push(query);
       try {
         const releases = await prowlarrClient.search(query);
-        mergeSearchResults(aggregated, seen, releases, (release) =>
+        mergeSearchResults(aggregated, seen, releases.filter((release) =>
+          !deniedSourceGuidSet.has(String(release.guid || "").trim())), (release) =>
           [release.guid, release.downloadUrl, release.indexerId, release.title]
             .map((entry) => String(entry || "").trim().toLowerCase())
             .join("\0"),
@@ -206,17 +238,12 @@ async function handleUsenetSearch(payload, helpers) {
     }
   }
   const ranked = rankUsenetReleases(aggregated, resolvedTrack);
-  const deniedSources = Array.isArray(job.deniedRemoteSources) ? job.deniedRemoteSources : [];
-  const deniedSourceGuidSet = new Set(
-    deniedSources
-      .filter((entry) => Array.isArray(entry) && entry[0] === "usenet")
-      .map((entry) => String(entry[1] || "").trim()),
-  );
   const filteredRanked = deniedSourceGuidSet.size > 0
     ? ranked.filter((entry) => !deniedSourceGuidSet.has(String(entry?.raw?.guid || "").trim()))
     : ranked;
   const qualityRanked = orderAdvertisedQualityCandidates(
-    filteredRanked.filter((entry) => entry.releaseAdmissible),
+    filteredRanked.filter((entry) => entry.releaseAdmissible
+      && (payload.albumGrab !== true || entry.resolvedAlbumName)),
     {
     ...qualityOptions,
     readName: (entry) => entry?.raw?.release?.title,
@@ -265,15 +292,29 @@ async function handleUsenetDownload(payload, helpers) {
     .then(({ recordTrackJobDownloading }) => recordTrackJobDownloading(job))
     .catch((err) => { console.warn(err); });
 
-  const client = getUsenetClient();
-  const clientKey = getUsenetClientKey();
-  let appended;
+  const client = getUsenetClient(payload.manualDownloadClient);
+  const clientKey = getUsenetClientKey(payload.manualDownloadClient);
+  let submission;
   try {
-    appended = await client.appendUrl({
-      name: release.title,
-      url: release.downloadUrl,
-      dupeKey: `aurral-${job.id}`,
-      dupeScore: Number(candidate.score || 0),
+    submission = await withPipelineCommitLock(payload, async () => {
+      const appended = await client.appendUrl({
+        name: release.title,
+        url: release.downloadUrl,
+        dupeKey: `aurral-${job.id}`,
+        dupeScore: Number(candidate.score || 0),
+      });
+      downloadTracker.updateDownloadMetadata(job.id, {
+        downloadSource: "usenet",
+        downloadClient: clientKey,
+        downloadClientId: appended.nzbId,
+        releaseGuid: release.guid,
+        releaseTitle: release.title,
+        indexerId: release.indexerId,
+        indexerName: release.indexer,
+        remoteUsername: release.indexer,
+        remoteFilename: release.title,
+      });
+      return appended;
     });
   } catch (error) {
     const message = error?.message || String(error);
@@ -286,21 +327,13 @@ async function handleUsenetDownload(payload, helpers) {
     if (hasNextCandidate(payload)) return buildNextCandidatePayload(payload, { nzbId: null, history: null });
     return helpers.failOrTryNextSource(payload, job, message);
   }
-  downloadTracker.updateDownloadMetadata(job.id, {
-    downloadSource: "usenet",
-    downloadClient: clientKey,
-    downloadClientId: appended.nzbId,
-    releaseGuid: release.guid,
-    releaseTitle: release.title,
-    indexerId: release.indexerId,
-    indexerName: release.indexer,
-    remoteUsername: release.indexer,
-    remoteFilename: release.title,
-  });
+  if (submission.cancelled || !isPipelinePayloadActive(payload)) return null;
+  const appended = submission.result;
   return {
     ...payload,
     phase: "poll",
     source: "usenet",
+    downloadClient: clientKey,
     nzbId: appended.nzbId,
     candidate,
     candidateIndex: index,
@@ -314,13 +347,13 @@ async function handleUsenetPoll(payload, helpers) {
   if (job.status === "failed" || job.status === "done") return null;
   const pollAttempts = Number(payload.pollAttempts || 0) + 1;
   if (pollAttempts > MAX_POLL_ATTEMPTS) {
-    if (getUsenetClientKey() === "sabnzbd") {
-      getSabnzbdClient().deleteHistoryItem(payload.nzbId).catch(() => {});
+    if (getUsenetClientKey(payload.downloadClient || payload.manualDownloadClient) === "sabnzbd") {
+      removeSabnzbdItem(payload.nzbId, job.id);
     }
     if (hasNextCandidate(payload)) return buildNextCandidatePayload(payload, { nzbId: null, history: null });
     return helpers.failOrTryNextSource(payload, job, "Usenet polling timed out");
   }
-  const client = getUsenetClient();
+  const client = getUsenetClient(payload.downloadClient || payload.manualDownloadClient);
   const historyItem = await client.getHistoryItem(payload.nzbId);
   if (historyItem) {
     const state = classifyHistoryStatus(historyItem);
@@ -334,8 +367,8 @@ async function handleUsenetPoll(payload, helpers) {
       };
     }
     if (state === "failed") {
-      if (getUsenetClientKey() === "sabnzbd") {
-        getSabnzbdClient().deleteHistoryItem(payload.nzbId).catch(() => {});
+      if (getUsenetClientKey(payload.downloadClient || payload.manualDownloadClient) === "sabnzbd") {
+        removeSabnzbdItem(payload.nzbId, job.id);
       }
       if (hasNextCandidate(payload)) return buildNextCandidatePayload(payload, { nzbId: null, history: null });
       return helpers.failOrTryNextSource(
@@ -368,17 +401,34 @@ async function handleUsenetFinalize(payload, helpers) {
   if (!job) return null;
   if (job.status === "failed" || job.status === "done") return null;
   const candidate = getPayloadCandidate(payload);
-  const client = getUsenetClient();
+  const client = getUsenetClient(payload.downloadClient || payload.manualDownloadClient);
   const historyItem = payload.history || (await client.getHistoryItem(payload.nzbId));
+  if (payload.albumGrab === true) {
+    const filePaths = await collectDownloadedAudioFiles(
+      historyItem, payload.downloadClient || payload.manualDownloadClient,
+    );
+    const next = await finishAlbumGrab(payload, {
+      filePaths, source: "usenet", album: candidate?.resolvedAlbumName || job.albumName,
+    });
+    if (getUsenetClientKey(payload.downloadClient || payload.manualDownloadClient) === "sabnzbd") {
+      removeSabnzbdItem(payload.nzbId, job.id);
+    }
+    return next;
+  }
   const resolvedTrack = {
     ...buildResolvedTrack(job, payload.track),
     upgradeForJobId: payload.upgradeForJobId || null,
   };
   const found = await validateDownloadedRelease(
-    await collectDownloadedAudioFiles(historyItem),
+    await collectDownloadedAudioFiles(historyItem, payload.downloadClient || payload.manualDownloadClient),
     candidate,
     resolvedTrack,
+    { manualSelection: payload.manualSelection === true },
   );
+  if (!isPipelinePayloadActive(payload)) {
+    if (job.downloadClient === "sabnzbd") removeSabnzbdItem(payload.nzbId, job.id);
+    return null;
+  }
   if (
     blockPipelineJobForReview({
       downloadTracker,
@@ -390,46 +440,52 @@ async function handleUsenetFinalize(payload, helpers) {
     return null;
   }
   if (!found.filePath) {
-    const reason =
-      found.validation?.reason ||
-      (found.validation?.error
-        ? MATCHER_UNAVAILABLE_MESSAGE
-        : "Usenet download completed, but no matching audio file was found");
-    if (getUsenetClientKey() === "sabnzbd") {
-      getSabnzbdClient().deleteHistoryItem(payload.nzbId).catch(() => {});
+    const reason = found.validation?.reason
+      || "Usenet download completed, but no matching audio file was found";
+    if (getUsenetClientKey(payload.downloadClient || payload.manualDownloadClient) === "sabnzbd") {
+      removeSabnzbdItem(payload.nzbId, job.id);
     }
     if (hasNextCandidate(payload)) return buildNextCandidatePayload(payload, { nzbId: null, history: null });
     return helpers.failOrTryNextSource(payload, job, reason);
   }
 
-  import("./aurralHistoryService.js")
-    .then(({ recordTrackJobMoving }) => recordTrackJobMoving(job))
-    .catch((err) => { console.warn(err); });
   const playlistRoot = resolvePlaylistRoot();
   const destination = String(payload.destination || "").trim();
   const ext = path.extname(found.filePath).toLowerCase();
   const finalDir = joinUnderRoot(playlistRoot, destination);
   const finalName = `${sanitizePathPart(job.trackName, "Unknown Track")}${ext || ".mp3"}`;
   const finalPath = path.join(finalDir, finalName);
-  await writeAudioMetadata(found.filePath, resolvedTrack);
-  const committedFinalPath = await commitImportToPlaylistLibrary(
-    found.filePath,
-    finalPath,
-  );
-  if (getUsenetClientKey() === "sabnzbd") {
-    getSabnzbdClient().deleteHistoryItem(payload.nzbId).catch(() => {});
-  }
-  return finalizePipelineJobSuccess({
-    downloadTracker,
-    job,
-    committedFinalPath,
-    album: candidate?.resolvedAlbumName || job.albumName,
-    quality: found.validation?.quality,
+  const inactiveOwner = deferForInactiveOwner(payload, job);
+  if (inactiveOwner) return inactiveOwner;
+  const committed = await withPipelineCommitLock(payload, async () => {
+    import("./aurralHistoryService.js")
+      .then(({ recordTrackJobMoving }) => recordTrackJobMoving(job))
+      .catch((err) => { console.warn(err); });
+    await writeAudioMetadata(found.filePath, resolvedTrack);
+    const committedFinalPath = await commitImportToPlaylistLibrary(
+      found.filePath,
+      finalPath,
+    );
+    if (getUsenetClientKey(payload.downloadClient || payload.manualDownloadClient) === "sabnzbd") {
+      removeSabnzbdItem(payload.nzbId, job.id);
+    }
+    return finalizePipelineJobSuccess({
+      downloadTracker,
+      job,
+      committedFinalPath,
+      album: candidate?.resolvedAlbumName || job.albumName,
+      quality: found.validation?.quality,
+    });
   });
+  if (committed.cancelled) {
+    return null;
+  }
+  return committed.result;
 }
 
 export async function processUsenetPipelinePayload(payload, helpers = {}) {
   logger.debug("slskd", "usenet pipeline phase", { phase: payload.phase, jobId: payload.jobId, source: payload.source });
+  if (!isPipelinePayloadActive(payload)) return null;
   switch (payload.phase) {
     case "search":
       return handleUsenetSearch(payload, helpers);

@@ -1,90 +1,138 @@
 import {
   enqueueHonkerStartupTasks,
-  getHonkerQueueDepth,
+  configureHonkerQueueWake,
+  getHonkerDb,
+  getHonkerQueueByName,
+  hasClaimableHonkerJobs,
+  hasExpiredHonkerClaims,
   getHonkerQueueNextClaimAt,
+  listBackgroundGroupsWithWork,
   startHonkerScheduler,
 } from "./honkerDb.js";
-import { startSystemTaskWorker } from "./systemTaskWorker.js";
-import { startLibraryScanWorker } from "./libraryScanWorker.js";
-import { startNotificationOutboxWorker } from "./notificationOutboxWorker.js";
-import { startPlayEventOutboxWorker } from "./playEventOutboxWorker.js";
-import { startSlskdOrchestratorWorker } from "./slskdOrchestratorWorker.js";
-import { startDiscoveryRefreshWorker } from "./discoveryRefreshWorker.js";
-import { startDiscoveryPlaylistBuildWorker } from "./discoveryPlaylistBuildWorker.js";
-import { startDiscoveryUserRefreshWorker } from "./discoveryUserRefreshWorker.js";
-import { startWeeklyFlowOperationWorker } from "./weeklyFlow/weeklyFlowOperationWorker.js";
-import { startWeeklyFlowPlaylistRetryWorker } from "./weeklyFlow/weeklyFlowPlaylistRetryWorker.js";
-import { startWeeklyFlowPlaylistReserveBuildWorker } from "./weeklyFlow/weeklyFlowPlaylistReserveBuildWorker.js";
-import { startPlaylistMbidEnrichmentWorker } from "./playlistMbidEnrichmentWorker.js";
-import {
-  startLibraryFileWatcher,
-  stopLibraryFileWatcher,
-} from "./libraryFileWatcher.js";
-import { registerHonkerShutdownHandler } from "./honkerWorkerRuntime.js";
+import { createBackgroundProcessSupervisor } from "./backgroundProcessSupervisor.js";
+import { ISOLATED_QUEUE_GROUPS, isQueueOwnedByGroup } from "./backgroundWorkerQueues.js";
+import { getHonkerWorkerStatuses, isHonkerShuttingDown, registerHonkerShutdownHandler } from "./honkerWorkerRuntime.js";
 import { HONKER_QUEUE_NAMES } from "./honkerDb.js";
-import { verifyMatcherRuntime } from "./trackMatching/index.js";
+import { configureFlowOwnerClient } from "./weeklyFlow/weeklyFlowOwnerClient.js";
 
 let backgroundWorkersStarted = false;
 let workerSupervisorStarted = false;
 let workerSupervisorInterval = null;
 let workerSupervisorTimer = null;
+let workerSupervisorTimerAt = null;
+let workerSweepInterval = null;
+const startingQueues = new Set();
+let supervisedGroup = null;
+let backgroundProcessSupervisor = null;
+let lastExpiredSweepAt = 0;
+let stopLibraryFileWatcher = null;
+
+export function getIsolatedWorkerStatuses() {
+  return backgroundProcessSupervisor?.getWorkerStatuses() || [];
+}
 
 const WORKER_SUPERVISOR_POLL_MS = Math.max(
-  15000,
-  Math.floor(Number(process.env.AURRAL_WORKER_SUPERVISOR_POLL_MS) || 60000),
+  process.env.AURRAL_BACKGROUND_WORKER_GROUP ? 1000 : 15000,
+  Math.floor(Number(process.env.AURRAL_WORKER_SUPERVISOR_POLL_MS) ||
+    (process.env.AURRAL_BACKGROUND_WORKER_GROUP ? 2000 : 60000)),
 );
 
 const WORKER_STARTS = {
-  "system-task": startSystemTaskWorker,
-  "library-scan": startLibraryScanWorker,
-  "_outbox:notifications": startNotificationOutboxWorker,
-  "_outbox:play-events": startPlayEventOutboxWorker,
-  "slskd-pipeline": startSlskdOrchestratorWorker,
-  "discovery-refresh": startDiscoveryRefreshWorker,
-  "discovery-playlist-build": startDiscoveryPlaylistBuildWorker,
-  "discovery-user-refresh": startDiscoveryUserRefreshWorker,
-  "weekly-flow-operation": startWeeklyFlowOperationWorker,
-  "playlist-retry": startWeeklyFlowPlaylistRetryWorker,
-  "playlist-reserve-build": startWeeklyFlowPlaylistReserveBuildWorker,
-  "playlist-mbid-enrichment": startPlaylistMbidEnrichmentWorker,
+  "release-metadata-refresh": ["./releaseMetadataWorker.js", "startReleaseMetadataWorker"],
+  "system-task": ["./systemTaskWorker.js", "startSystemTaskWorker"],
+  "system-task-maintenance": ["./systemTaskWorker.js", "startMaintenanceTaskWorker"],
+  "system-task-inbox": ["./systemTaskWorker.js", "startInboxTaskWorker"],
+  "library-scan": ["./libraryScanWorker.js", "startLibraryScanWorker"],
+  "_outbox:notifications": ["./notificationOutboxWorker.js", "startNotificationOutboxWorker"],
+  "_outbox:play-events": ["./playEventOutboxWorker.js", "startPlayEventOutboxWorker"],
+  "slskd-pipeline": ["./slskdOrchestratorWorker.js", "startSlskdOrchestratorWorker"],
+  "discovery-refresh": ["./discoveryRefreshWorker.js", "startDiscoveryRefreshWorker"],
+  "discovery-playlist-build": ["./discoveryPlaylistBuildWorker.js", "startDiscoveryPlaylistBuildWorker"],
+  "discovery-user-refresh": ["./discoveryUserRefreshWorker.js", "startDiscoveryUserRefreshWorker"],
+  "weekly-flow-operation": ["./weeklyFlow/weeklyFlowOperationWorker.js", "startWeeklyFlowOperationWorker"],
+  "playlist-retry": ["./weeklyFlow/weeklyFlowPlaylistRetryWorker.js", "startWeeklyFlowPlaylistRetryWorker"],
+  "playlist-reserve-build": ["./weeklyFlow/weeklyFlowPlaylistReserveBuildWorker.js", "startWeeklyFlowPlaylistReserveBuildWorker"],
+  "playlist-mbid-enrichment": ["./playlistMbidEnrichmentWorker.js", "startPlaylistMbidEnrichmentWorker"],
 };
 
 const QUEUE_WORKERS = HONKER_QUEUE_NAMES.map((queue) => ({
   queue,
   start: WORKER_STARTS[queue],
-})).filter((worker) => typeof worker.start === "function");
+})).filter((worker) => Array.isArray(worker.start));
+
+function startQueueWorker([modulePath, startName], queueName) {
+  if (startingQueues.has(queueName)) return;
+  startingQueues.add(queueName);
+  import(modulePath)
+    .then((module) => {
+      if (!isHonkerShuttingDown() && workerSupervisorStarted) module[startName]();
+    })
+    .catch((error) => {
+      console.warn(`[AppRuntime] Failed to start ${queueName}:`, error?.message || error);
+    })
+    .finally(() => startingQueues.delete(queueName));
+}
 
 function clearSupervisorWakeTimer() {
   if (!workerSupervisorTimer) return;
   clearTimeout(workerSupervisorTimer);
   workerSupervisorTimer = null;
+  workerSupervisorTimerAt = null;
 }
 
 function scheduleSupervisorWake(nextClaimAt) {
-  clearSupervisorWakeTimer();
   const timestamp = Number(nextClaimAt);
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return;
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    clearSupervisorWakeTimer();
+    return;
+  }
   const waitMs = timestamp * 1000 - Date.now();
   if (waitMs <= 0) return;
+  const target = Date.now() + Math.max(1000, Math.min(waitMs, 2147483647));
+  if (workerSupervisorTimer && workerSupervisorTimerAt <= target) return;
+  clearSupervisorWakeTimer();
+  workerSupervisorTimerAt = target;
   workerSupervisorTimer = setTimeout(
     () => {
       workerSupervisorTimer = null;
-      checkQueuedBackgroundWork();
+      workerSupervisorTimerAt = null;
+      checkQueuedBackgroundWork(supervisedGroup);
     },
-    Math.max(1000, Math.min(waitMs, WORKER_SUPERVISOR_POLL_MS)),
+    target - Date.now(),
   );
   if (typeof workerSupervisorTimer.unref === "function") {
     workerSupervisorTimer.unref();
   }
 }
 
-function checkQueuedBackgroundWork() {
-  if (process.env.AURRAL_TEST_SERVER === "1") return;
-  let nextClaimAt = null;
+function sweepExpiredWorkerQueues(group) {
+  if (Date.now() - lastExpiredSweepAt < 30000) return 0;
+  lastExpiredSweepAt = Date.now();
+  let swept = 0;
   for (const worker of QUEUE_WORKERS) {
+    if (!isQueueOwnedByGroup(worker.queue, group)) continue;
     try {
-      if (getHonkerQueueDepth(worker.queue) > 0) {
-        worker.start();
+      swept += Number(getHonkerQueueByName(worker.queue)?.sweepExpired()) || 0;
+      if (hasExpiredHonkerClaims(worker.queue)) swept++;
+    } catch (error) {
+      console.warn(`[AppRuntime] Failed to recover ${worker.queue}:`, error?.message || error);
+    }
+  }
+  return swept;
+}
+
+function checkQueuedBackgroundWork(group = null) {
+  if (process.env.AURRAL_TEST_SERVER === "1" || isHonkerShuttingDown()) return;
+  let nextClaimAt = null;
+  sweepExpiredWorkerQueues(group);
+  const running = new Set(getHonkerWorkerStatuses().filter((worker) => worker.running).map((worker) => worker.name));
+  for (const worker of QUEUE_WORKERS) {
+    if (!isQueueOwnedByGroup(worker.queue, group)) continue;
+    try {
+      const workerName = worker.queue === "_outbox:notifications" ? "notification-outbox"
+        : worker.queue === "_outbox:play-events" ? "play-event-outbox" : worker.queue;
+      if (!running.has(workerName) && !startingQueues.has(worker.queue) && hasClaimableHonkerJobs(worker.queue)) {
+        startQueueWorker(worker.start, worker.queue);
       }
       const queueNextClaimAt = getHonkerQueueNextClaimAt(worker.queue);
       if (queueNextClaimAt && (nextClaimAt == null || queueNextClaimAt < nextClaimAt)) {
@@ -100,13 +148,18 @@ function checkQueuedBackgroundWork() {
   scheduleSupervisorWake(nextClaimAt);
 }
 
-function startWorkerSupervisor() {
+export function startWorkerSupervisor({ group = null } = {}) {
   if (workerSupervisorStarted || process.env.AURRAL_TEST_SERVER === "1") {
     return;
   }
   workerSupervisorStarted = true;
-  checkQueuedBackgroundWork();
-  workerSupervisorInterval = setInterval(checkQueuedBackgroundWork, WORKER_SUPERVISOR_POLL_MS);
+  supervisedGroup = group;
+  checkQueuedBackgroundWork(group);
+  workerSupervisorInterval = setInterval(() => checkQueuedBackgroundWork(group), WORKER_SUPERVISOR_POLL_MS);
+  workerSweepInterval = setInterval(() => {
+    if (sweepExpiredWorkerQueues(group) > 0) checkQueuedBackgroundWork(group);
+  }, 30000);
+  workerSweepInterval.unref?.();
   if (typeof workerSupervisorInterval.unref === "function") {
     workerSupervisorInterval.unref();
   }
@@ -114,7 +167,10 @@ function startWorkerSupervisor() {
 
 function stopWorkerSupervisor() {
   workerSupervisorStarted = false;
+  supervisedGroup = null;
   clearSupervisorWakeTimer();
+  clearInterval(workerSweepInterval);
+  workerSweepInterval = null;
   if (workerSupervisorInterval) {
     clearInterval(workerSupervisorInterval);
     workerSupervisorInterval = null;
@@ -123,8 +179,81 @@ function stopWorkerSupervisor() {
 
 registerHonkerShutdownHandler(() => {
   stopWorkerSupervisor();
-  stopLibraryFileWatcher();
+  stopLibraryFileWatcher?.();
+  return backgroundProcessSupervisor?.stop();
 });
+
+export async function forwardWorkerBroadcast(message) {
+  if (message?.type !== "websocket-broadcast" || typeof message.channel !== "string") return;
+  const { websocketService } = await import("./websocketService.js");
+  if (message.channel === "discovery") {
+    try {
+      const { synchronizeDiscoveryCacheFromWorker } = await import("./discovery/persistence.js");
+      synchronizeDiscoveryCacheFromWorker(message.data);
+    } catch (error) {
+      console.warn("[AppRuntime] Could not refresh discovery state:", error?.message || error);
+    }
+  }
+  if (message.channel === "library" && message.data?.type === "library_scan_completed") {
+    const { invalidateCanonicalLibraryCache } = await import("./libraryQueryService.js");
+    invalidateCanonicalLibraryCache({ persistedGenres: false });
+    const { clearSearchContextCache } = await import("./unifiedSearchService.js");
+    clearSearchContextCache();
+  }
+  websocketService.broadcast(message.channel, message.data);
+}
+
+export function wakeQueuedBackgroundWork(group = supervisedGroup) {
+  checkQueuedBackgroundWork(group);
+}
+
+export function hasQueuedBackgroundWork(group = supervisedGroup) {
+  if (startingQueues.size > 0) return true;
+  if (getHonkerWorkerStatuses().some((worker) => worker.running)) return true;
+  return QUEUE_WORKERS.some((worker) =>
+    isQueueOwnedByGroup(worker.queue, group) && hasClaimableHonkerJobs(worker.queue));
+}
+
+export async function recoverExitedWorkerJobs(group, pid, logger = console, reason = null) {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  const workerId = `aurral-${pid}`;
+  const database = getHonkerDb();
+  const rows = database.query(
+    "SELECT id, queue FROM _honker_live WHERE worker_id = ? AND state = 'processing'",
+    [workerId],
+  );
+  for (const row of rows) {
+    if (ISOLATED_QUEUE_GROUPS[row.queue] !== group) continue;
+    try {
+      if (row.queue === "library-scan") {
+        const { restoreLibraryScanAfterWorkerExit } = await import("./libraryScanWorker.js");
+        restoreLibraryScanAfterWorkerExit(row.id);
+      }
+      try {
+        const { recordHonkerTaskRunFinished } = await import("./honkerTaskStatus.js");
+        const runs = database.query(
+          "SELECT id FROM honker_task_runs WHERE job_id = ? AND worker_id = ? AND status = 'running'",
+          [row.id, workerId],
+        );
+        for (const run of runs) {
+          recordHonkerTaskRunFinished(run.id, "failed", reason || "Background worker process exited");
+        }
+      } catch (error) {
+        logger.warn?.(`[AppRuntime] Could not update ${row.queue} task history:`, error?.message || error);
+      }
+      // Honker registers retry on its queue connection, not on the raw query connection.
+      getHonkerQueueByName(row.queue)._retry(
+        row.id, workerId, 1, reason || "Background worker process exited",
+      );
+    } catch (error) {
+      logger.warn?.(`[AppRuntime] Could not requeue ${row.queue} job ${row.id}:`, error?.message || error);
+    }
+  }
+  if (group === "flow") {
+    const { downloadTracker } = await import("./weeklyFlow/weeklyFlowDownloadTracker.js");
+    downloadTracker.resetDownloadingToPending();
+  }
+}
 
 export function startBackgroundWorkers({ logger = console } = {}) {
   if (backgroundWorkersStarted || process.env.AURRAL_TEST_SERVER === "1") {
@@ -153,25 +282,129 @@ export function startBackgroundWorkers({ logger = console } = {}) {
       );
     });
   enqueueHonkerStartupTasks();
-  startWorkerSupervisor();
-  void startLibraryFileWatcher({ logger }).catch((error) => {
-    logger.warn?.(
-      "[AppRuntime] Failed to start library file watcher:",
-      error?.message || error,
-    );
+  if (HONKER_QUEUE_NAMES.some((queue) => isQueueOwnedByGroup(queue))) {
+    startWorkerSupervisor();
+  }
+  backgroundProcessSupervisor = createBackgroundProcessSupervisor({
+    logger,
+    findGroupsWithWork: () => (isHonkerShuttingDown() ? [] : listBackgroundGroupsWithWork()),
+    onMessage(message, _group, child) {
+      if (message?.type === "queue-wake") {
+        const owner = ISOLATED_QUEUE_GROUPS[message.queue];
+        if (owner) backgroundProcessSupervisor.wake(owner);
+        else if (isQueueOwnedByGroup(message.queue)) checkQueuedBackgroundWork();
+        return;
+      }
+      if (message?.type === "flow-client-request") {
+        void backgroundProcessSupervisor.request("flow", message.method, message.args, {
+          timeoutMs: Math.min(30 * 60 * 1000, Number(message.timeoutMs) || 30000),
+        }).then((result) => {
+          if (child.connected) child.send({
+            type: "flow-client-response", requestId: message.requestId, result,
+          });
+        }).catch((error) => {
+          if (child.connected) child.send({
+            type: "flow-client-response", requestId: message.requestId,
+            error: error?.message || String(error),
+          });
+        });
+        return;
+      }
+      if (message?.type === "cache-invalidate" && message.cache === "flow") {
+        void Promise.all([
+          import("../db/helpers/index.js"),
+          import("./weeklyFlow/weeklyFlowPlaylistConfig.js"),
+        ]).then(([{ dbOps }, { invalidateFlowPlaylistConfigCache }]) => {
+          dbOps.invalidateSettingsCache();
+          invalidateFlowPlaylistConfigCache();
+        }).catch((error) => {
+          logger.warn?.("[AppRuntime] Could not refresh flow cache:", error?.message || error);
+        });
+        return;
+      }
+      if (message?.type === "cache-invalidate" && message.cache === "lidarr-artists") {
+        void import("./libraryManager.js").then(({ invalidateLidarrArtistCache }) => {
+          invalidateLidarrArtistCache();
+        }).catch((error) => {
+          logger.warn?.("[AppRuntime] Could not refresh Lidarr artist cache:", error?.message || error);
+        });
+        return;
+      }
+      if (message?.type === "job-finished" && _group === "flow") {
+        void Promise.all([
+          import("../db/helpers/index.js"),
+          import("./weeklyFlow/weeklyFlowPlaylistConfig.js"),
+        ]).then(([{ dbOps }, { invalidateFlowPlaylistConfigCache }]) => {
+          dbOps.invalidateSettingsCache();
+          invalidateFlowPlaylistConfigCache();
+        });
+        return;
+      }
+      if (message?.type === "cache-invalidate" && message.cache === "news") {
+        void import("./newsService.js").then(({ invalidateNewsResponseCache }) => {
+          invalidateNewsResponseCache();
+        }).catch((error) => {
+          logger.warn?.("[AppRuntime] Could not refresh news cache:", error?.message || error);
+        });
+        return;
+      }
+      void forwardWorkerBroadcast(message).catch((error) => {
+        logger.warn?.("[AppRuntime] Failed to forward worker update:", error?.message || error);
+      });
+    },
+    onExit(group, _code, _signal, pid, reason, retired) {
+      const recovery = recoverExitedWorkerJobs(group, pid, logger, reason).catch((error) => {
+        logger.warn?.(`[AppRuntime] Could not recover ${group} jobs:`, error?.message || error);
+      });
+      if (retired) return recovery;
+      if (group !== "discovery-refresh" && group !== "discovery-playlist-build") return recovery;
+      void forwardWorkerBroadcast({
+        type: "websocket-broadcast",
+        channel: "discovery",
+        data: group === "discovery-refresh" ? {
+          type: "discovery_update",
+          isUpdating: false,
+          phase: "error",
+          progressMessage: "Discovery refresh stopped; queued jobs will retry",
+        } : {
+          type: "discovery_update",
+          playlistsUpdating: false,
+          playlistsUpdateMessage: "Playlist build stopped; queued jobs will retry",
+        },
+      }).catch((error) => {
+        logger.warn?.("[AppRuntime] Failed to report discovery restart:", error?.message || error);
+      });
+      return recovery;
+    },
   });
+  configureFlowOwnerClient({
+    request: (method, args, options) =>
+      backgroundProcessSupervisor.request("flow", method, args, options),
+    getStatus: () => backgroundProcessSupervisor.getFlowStatus(),
+  });
+  configureHonkerQueueWake((queue) => {
+    if (isHonkerShuttingDown()) return;
+    const owner = ISOLATED_QUEUE_GROUPS[queue];
+    if (owner) backgroundProcessSupervisor.wake(owner);
+    else checkQueuedBackgroundWork();
+  });
+  backgroundProcessSupervisor.start();
+  void import("./libraryFileWatcher.js")
+    .then((module) => {
+      stopLibraryFileWatcher = module.stopLibraryFileWatcher;
+      if (isHonkerShuttingDown()) return;
+      return module.startLibraryFileWatcher({ logger });
+    })
+    .catch((error) => {
+      logger.warn?.(
+        "[AppRuntime] Failed to start library file watcher:",
+        error?.message || error,
+      );
+    });
   return true;
 }
 
 export function initializeAppRuntime({ logger = console } = {}) {
-  startHonkerScheduler();
+  if (process.env.AURRAL_TEST_SERVER === "1") startHonkerScheduler();
   startBackgroundWorkers({ logger });
-  // The bundled beets matcher is production-critical for downloads; a broken
-  // Python/beets installation must be obvious at startup.
-  void verifyMatcherRuntime().catch((error) => {
-    logger.warn?.(
-      "[AppRuntime] Track matcher self-test crashed:",
-      error?.message || error,
-    );
-  });
 }

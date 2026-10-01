@@ -10,6 +10,7 @@ import {
   queryClient,
   queryKeys,
 } from "../../../queryClient.js";
+import { getLibraryOwnerConflict } from "../../libraryDestination.js";
 
 const buildStreamUrl = (path) => buildAuthenticatedApiUrl(path);
 const SLOW_LIBRARY_REQUEST_TIMEOUT_MS = 90000;
@@ -65,7 +66,29 @@ export const clearCanonicalLibraryPageCache = () => {
   });
 };
 
-export const requestLibraryRefresh = () => postData("/library/refresh", {});
+export const settleLibraryOwnerConflict = (error) => {
+  const conflict = getLibraryOwnerConflict(error);
+  if (!conflict) return null;
+  clearCanonicalLibraryPageCache();
+  queryClient.invalidateQueries({ queryKey: queryKeys.libraryPrefix });
+  return conflict;
+};
+
+export const requestLibraryRefresh = (mode = "quick") =>
+  postData("/library/refresh", { mode });
+
+export const updateLibraryArtistMbid = async (artistId, mbid) => {
+  const result = await putData(
+    `/library/canonical/artists/${encodeURIComponent(artistId)}/mbid`,
+    { mbid },
+  );
+  clearCanonicalLibraryPageCache();
+  void queryClient.invalidateQueries({ queryKey: queryKeys.libraryPrefix });
+  return result;
+};
+
+export const getLibraryTrackFiles = (trackId, options = {}) =>
+  getData(`/library/tracks/${encodeURIComponent(trackId)}/files`, options);
 
 export const getActiveLibraryRefresh = () => getData("/library/refresh");
 
@@ -242,6 +265,11 @@ export const deleteAlbumFromLibrary = (id, deleteFiles = false) =>
     params: { deleteFiles },
   });
 
+export const deleteAurralAlbumFromLibrary = (canonicalId, deleteFiles = false) =>
+  deleteData(`/library/albums/aurral/${encodeURIComponent(canonicalId)}`, {
+    params: { deleteFiles },
+  });
+
 export const deleteTrackFromLibrary = (id) =>
   deleteData(`/library/tracks/${encodeURIComponent(id)}`);
 
@@ -330,6 +358,11 @@ export const downloadAlbum = (artistId, albumId, options = {}) =>
 export const downloadTrackToLibrary = (track) =>
   postData("/library/downloads/track", track);
 
+export const reSearchLibraryTrack = (trackId, { albumId } = {}) =>
+  postData(`/library/downloads/tracks/${encodeURIComponent(trackId)}/research`, {
+    albumId,
+  });
+
 export const triggerAlbumSearch = (albumId) =>
   postData("/library/downloads/album/search", {
     albumId,
@@ -350,6 +383,15 @@ export const getDownloadStatus = async (albumIds, { signal, bypassCache = false 
     staleTime: 4_000,
   });
 };
+
+export const getAurralAlbumStatus = (canonicalId, { signal } = {}) =>
+  getData(`/library/albums/aurral/${encodeURIComponent(canonicalId)}/status`, { signal });
+
+export const cancelAurralAlbum = (canonicalId) =>
+  postData(`/library/albums/aurral/${encodeURIComponent(canonicalId)}/cancel`);
+
+export const setAurralAlbumMonitoring = (canonicalId, monitored) =>
+  putData(`/library/albums/aurral/${encodeURIComponent(canonicalId)}`, { monitored });
 
 export const refreshLibraryArtist = (mbid) =>
   postData(`/library/artists/${mbid}/refresh`);

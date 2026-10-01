@@ -8,6 +8,7 @@ import {
   MUSICBRAINZ_API,
 } from "../../config/constants.js";
 import {
+  getNormalizedText,
   rankAlbumCandidates,
   rankArtistCandidates,
   scoreTextMatch,
@@ -25,15 +26,34 @@ import {
 import { selectBestAlbumImage } from "../imageService.js";
 import createRateLimiter from "../apiClients/rateLimiter.js";
 import { runSharedInflight } from "../sharedInflight.js";
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  getMetadataProviderBudget,
+  reserveMetadataProviderRequest,
+  setMetadataProviderCooldown,
+} from "../metadataProviderBudget.js";
 
-const METADATA_CACHE_TTL_SECONDS = 24 * 60 * 60;
+const METADATA_ENTITY_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60;
+const METADATA_ENTITY_STALE_TTL_SECONDS = 30 * 24 * 60 * 60;
+const METADATA_SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60;
+const METADATA_NOT_FOUND_CACHE_TTL_SECONDS = 24 * 60 * 60;
+const METADATA_RATE_LIMIT_FALLBACK_COOLDOWN_MS = 5_000;
+const METADATA_RATE_LIMIT_MAX_COOLDOWN_MS = 60_000;
+const METADATA_FORBIDDEN_COOLDOWN_MS = 5 * 60_000;
 const METADATA_CACHE_MAX_ENTRIES = 20_000;
 const METADATA_REQUEST_MIN_INTERVAL_MS = 100;
 const METADATA_REQUEST_TIMEOUT_MS = 8000;
 const METADATA_MAX_QUEUED_REQUESTS = Math.floor(
   METADATA_REQUEST_TIMEOUT_MS / METADATA_REQUEST_MIN_INTERVAL_MS,
 ) - 1;
-const providerCache = createCache(METADATA_CACHE_TTL_SECONDS, METADATA_CACHE_MAX_ENTRIES);
+const providerCache = createCache(
+  METADATA_ENTITY_CACHE_TTL_SECONDS,
+  METADATA_CACHE_MAX_ENTRIES,
+);
+const metadataNotFoundCache = createCache(
+  METADATA_NOT_FOUND_CACHE_TTL_SECONDS,
+  METADATA_CACHE_MAX_ENTRIES,
+);
 const releaseCache = createCache(300);
 const providerInflightRequests = new Map();
 const providerRequestLimiter = createRateLimiter(METADATA_REQUEST_MIN_INTERVAL_MS, {
@@ -43,6 +63,7 @@ const METADATA_MAX_RETRIES = 1;
 
 export function clearMetadataProviderCaches() {
   providerCache.flushAll();
+  metadataNotFoundCache.flushAll();
   releaseCache.flushAll();
   providerInflightRequests.clear();
 }
@@ -91,6 +112,79 @@ function getUserAgent() {
   return `${APP_NAME}/${APP_VERSION}`;
 }
 
+function isEntityMetadataPath(path) {
+  return /^\/(?:album|artist)\/[^/]+$/.test(path);
+}
+
+function createMetadataNotFoundError() {
+  const error = new Error("Metadata resource not found");
+  error.code = "ERR_METADATA_NOT_FOUND";
+  error.response = { status: 404 };
+  return error;
+}
+
+function createMetadataCircuitError(code, status, remainingMs) {
+  const error = new Error(
+    code === "ERR_METADATA_FORBIDDEN"
+      ? "Metadata provider access is temporarily blocked"
+      : "Metadata provider rate limit cooldown is active",
+  );
+  error.code = code;
+  error.retryAfterMs = Math.max(0, Math.ceil(remainingMs));
+  error.response = { status };
+  return error;
+}
+
+function isMetadataCircuitError(error) {
+  return error?.code === "ERR_METADATA_FORBIDDEN" || error?.code === "ERR_METADATA_RATE_LIMITED";
+}
+
+function getRetryAfterMs(error) {
+  const retryAfter =
+    error?.response?.headers?.["retry-after"] ?? error?.response?.headers?.["Retry-After"];
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(
+      METADATA_RATE_LIMIT_MAX_COOLDOWN_MS,
+      Math.max(METADATA_RATE_LIMIT_FALLBACK_COOLDOWN_MS, seconds * 1000),
+    );
+  }
+  const retryAt = Date.parse(String(retryAfter || ""));
+  if (Number.isFinite(retryAt)) {
+    return Math.min(
+      METADATA_RATE_LIMIT_MAX_COOLDOWN_MS,
+      Math.max(METADATA_RATE_LIMIT_FALLBACK_COOLDOWN_MS, retryAt - Date.now()),
+    );
+  }
+  return METADATA_RATE_LIMIT_FALLBACK_COOLDOWN_MS;
+}
+
+function getMetadataCircuitError(baseUrl) {
+  const now = Date.now();
+  const budget = getMetadataProviderBudget(baseUrl);
+  if (budget.forbidden_until > now) {
+    return createMetadataCircuitError(
+      "ERR_METADATA_FORBIDDEN",
+      403,
+      budget.forbidden_until - now,
+    );
+  }
+  if (budget.rate_limited_until > now) {
+    return createMetadataCircuitError(
+      "ERR_METADATA_RATE_LIMITED",
+      429,
+      budget.rate_limited_until - now,
+    );
+  }
+  return null;
+}
+
+function openMetadataCircuit(baseUrl, status, error) {
+  const cooldownMs =
+    status === 403 ? METADATA_FORBIDDEN_COOLDOWN_MS : getRetryAfterMs(error);
+  setMetadataProviderCooldown(baseUrl, status, Date.now() + cooldownMs);
+}
+
 function isRetryable(error) {
   return (
     ["ECONNABORTED", "ETIMEDOUT", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN"].includes(error?.code) ||
@@ -98,11 +192,24 @@ function isRetryable(error) {
   );
 }
 
-async function request(path, params = {}, { signal } = {}) {
+function getMetadataCachePolicy(path) {
+  if (isEntityMetadataPath(path)) {
+    return {
+      freshTtlSeconds: METADATA_ENTITY_CACHE_TTL_SECONDS,
+      staleTtlSeconds: METADATA_ENTITY_STALE_TTL_SECONDS,
+    };
+  }
+  return {
+    freshTtlSeconds: METADATA_SEARCH_CACHE_TTL_SECONDS,
+    staleTtlSeconds: 0,
+  };
+}
+
+function refreshMetadata(cacheKey, path, params, { signal } = {}) {
   const baseUrl = getMetadataBaseUrl();
-  const cacheKey = `${baseUrl}${path}:${JSON.stringify(params)}`;
-  const cached = providerCache.get(cacheKey);
-  if (cached) return cached;
+  const cachePolicy = getMetadataCachePolicy(path);
+  const circuitError = getMetadataCircuitError(baseUrl);
+  if (circuitError) return Promise.reject(circuitError);
   healthState.activeBaseUrl = baseUrl;
   healthState.lastCheckedAt = nowIso();
 
@@ -111,20 +218,49 @@ async function request(path, params = {}, { signal } = {}) {
       if (sharedSignal.aborted) throw sharedSignal.reason || new Error("The operation was aborted");
       try {
         const response = await providerRequestLimiter.schedule(
-          (remainingMs) =>
-            axios.get(`${baseUrl}${path}`, {
+          async (remainingMs) => {
+            const activeCircuitError = getMetadataCircuitError(baseUrl);
+            if (activeCircuitError) throw activeCircuitError;
+            const admissionStarted = Date.now();
+            let waitMs;
+            while ((waitMs = reserveMetadataProviderRequest(baseUrl, METADATA_REQUEST_MIN_INTERVAL_MS)) > 0) {
+              if (waitMs >= remainingMs - (Date.now() - admissionStarted)) {
+                const error = new Error("Metadata provider request deadline exceeded");
+                error.code = "ETIMEDOUT";
+                throw error;
+              }
+              await delay(waitMs, undefined, { signal: sharedSignal });
+              const waitingCircuit = getMetadataCircuitError(baseUrl);
+              if (waitingCircuit) throw waitingCircuit;
+            }
+            const circuitAfterWait = getMetadataCircuitError(baseUrl);
+            if (circuitAfterWait) throw circuitAfterWait;
+            const requestTimeoutMs = remainingMs - (Date.now() - admissionStarted);
+            if (requestTimeoutMs <= 0) {
+              const error = new Error("Metadata provider request deadline exceeded");
+              error.code = "ETIMEDOUT";
+              throw error;
+            }
+            return axios.get(`${baseUrl}${path}`, {
               params,
-              timeout: Number.isFinite(remainingMs)
-                ? Math.max(1, Math.floor(remainingMs))
+              timeout: Number.isFinite(requestTimeoutMs)
+                ? Math.max(1, Math.floor(requestTimeoutMs))
                 : METADATA_REQUEST_TIMEOUT_MS,
               headers: {
                 "User-Agent": getUserAgent(),
               },
               signal: sharedSignal,
-            }),
+            });
+          },
           { signal: sharedSignal, timeoutMs: METADATA_REQUEST_TIMEOUT_MS },
         );
-        providerCache.set(cacheKey, response.data);
+        providerCache.set(
+          cacheKey,
+          response.data,
+          cachePolicy.freshTtlSeconds,
+          cachePolicy.staleTtlSeconds,
+        );
+        metadataNotFoundCache.delete(cacheKey);
         healthState.lastSuccessAt = healthState.lastCheckedAt;
         healthState.lastFailureReason = "";
         return response.data;
@@ -135,6 +271,16 @@ async function request(path, params = {}, { signal } = {}) {
           error?.response?.status != null
             ? `HTTP ${error.response.status}`
             : error?.code || error?.message || "Unknown error";
+        if ([403, 429].includes(error?.response?.status)) {
+          if (!isMetadataCircuitError(error)) {
+            openMetadataCircuit(baseUrl, error.response.status, error);
+          }
+          throw error;
+        }
+        if (error?.response?.status === 404 && isEntityMetadataPath(path)) {
+          providerCache.delete(cacheKey);
+          metadataNotFoundCache.set(cacheKey, true);
+        }
         if (attempt === METADATA_MAX_RETRIES || !isRetryable(error)) throw error;
         await new Promise((resolve, reject) => {
           const onAbort = () => {
@@ -152,6 +298,22 @@ async function request(path, params = {}, { signal } = {}) {
     }
     throw new Error("Metadata provider request failed");
   }, { signal });
+}
+
+async function request(path, params = {}, { signal, forceRefresh = false } = {}) {
+  const baseUrl = getMetadataBaseUrl();
+  const cacheKey = `${baseUrl}${path}:${JSON.stringify(params)}`;
+  if (!forceRefresh && metadataNotFoundCache.get(cacheKey)) {
+    throw createMetadataNotFoundError();
+  }
+  const cached = forceRefresh ? null : providerCache.getWithStale(cacheKey);
+  if (cached) {
+    if (cached.stale) {
+      void refreshMetadata(cacheKey, path, params).catch(() => {});
+    }
+    return cached.value;
+  }
+  return refreshMetadata(cacheKey, path, params, { signal });
 }
 
 function applyReleaseTypeFilter(albums, releaseTypes = []) {
@@ -212,18 +374,20 @@ export async function getAlbumTracksByAlbumMbid(albumMbid) {
   return Array.isArray(release?.tracks) ? release.tracks : [];
 }
 
-export async function searchArtists(query, { limit = 24, offset = 0 } = {}) {
+export async function searchArtists(query, { limit = 24, offset = 0, signal } = {}) {
   let items = [];
   try {
     const data = await request("/search/artist", {
       query,
       limit,
-    });
+    }, { signal });
     const source = Array.isArray(data) ? data : [];
     items = source.map((entry) => ({
       ...toNormalizedArtist(entry),
     }));
-  } catch {}
+  } catch {
+    signal?.throwIfAborted();
+  }
   return {
     query,
     count: items.length,
@@ -234,7 +398,7 @@ export async function searchArtists(query, { limit = 24, offset = 0 } = {}) {
 
 export async function searchAlbums(
   query,
-  { artistName = "", limit = 24, offset = 0, releaseTypes = [], sort = "relevance" } = {},
+  { artistName = "", limit = 24, offset = 0, releaseTypes = [], sort = "relevance", signal } = {},
 ) {
   const requestedLimit = Math.max(limit + offset, limit);
   let items = [];
@@ -244,7 +408,7 @@ export async function searchAlbums(
       query,
       limit: requestedLimit,
       ...(artistName ? { artist: artistName } : {}),
-    });
+    }, { signal });
     const source = Array.isArray(data) ? data : [];
     items = source.map((entry, index) => {
       const artists = Array.isArray(entry?.artists) ? entry.artists : [];
@@ -265,7 +429,9 @@ export async function searchAlbums(
         releaseStatuses: [],
       };
     });
-  } catch {}
+  } catch {
+    signal?.throwIfAborted();
+  }
 
   if (items.length === 0 && isNarrowFallbacksEnabled()) {
     const escapeLucenePhrase = (value) =>
@@ -286,6 +452,7 @@ export async function searchAlbums(
       headers: {
         "User-Agent": `${APP_NAME}/${APP_VERSION} (metadata album fallback)`,
       },
+      signal,
     });
     const source = Array.isArray(response?.data?.["release-groups"])
       ? response.data["release-groups"]
@@ -348,6 +515,35 @@ export async function resolveArtistByName(name) {
   return ranked[0]?.id || null;
 }
 
+function artistNameForms(name) {
+  const value = String(name || "").trim();
+  const parts = value.split(",").map((part) => part.trim());
+  const variants = parts.length === 2 && parts.every(Boolean)
+    ? [value, `${parts[1]} ${parts[0]}`]
+    : [value];
+  return variants
+    .map((variant) => getNormalizedText(variant).replace(/^the /, ""))
+    .filter(Boolean);
+}
+
+export async function resolveLibraryArtistByName(name) {
+  const forms = new Set(artistNameForms(name));
+  if (forms.size === 0) return null;
+  const data = await request("/search/artist", { query: String(name).trim(), limit: 10 });
+  const matches = new Set(
+    (Array.isArray(data) ? data : [])
+      .map(toNormalizedArtist)
+      .filter((artist) =>
+        artist.id &&
+        [artist.name, ...artist.aliases].some((candidate) =>
+          artistNameForms(candidate).some((form) => forms.has(form)),
+        ),
+      )
+      .map((artist) => artist.id),
+  );
+  return matches.size === 1 ? [...matches][0] : null;
+}
+
 export async function resolveAlbumByArtistAndTitle({
   artistName = "",
   albumTitle = "",
@@ -383,9 +579,15 @@ export async function resolveAlbumByArtistAndTitle({
 
 export async function listArtistAlbums(
   artistMbid,
-  { releaseTypes = [], includeTrackCounts = false, hydrateLimit = 30, signal } = {},
+  {
+    releaseTypes = [],
+    includeTrackCounts = false,
+    hydrateLimit = 30,
+    signal,
+    forceRefresh = false,
+  } = {},
 ) {
-  const rawArtist = await request(`/artist/${artistMbid}`, {}, { signal });
+  const rawArtist = await request(`/artist/${artistMbid}`, {}, { signal, forceRefresh });
   const artist = toNormalizedArtist(rawArtist);
   let albums = (Array.isArray(rawArtist?.Albums) ? rawArtist.Albums : []).map((entry) =>
     toNormalizedArtistAlbum(entry),

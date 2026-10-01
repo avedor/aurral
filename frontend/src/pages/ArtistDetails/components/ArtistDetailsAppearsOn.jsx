@@ -6,8 +6,9 @@ import SearchLibraryCheck from "../../../components/SearchLibraryCheck";
 import AddActionButton from "../../../components/AddActionButton";
 import { navigateToReleaseGroup } from "../../../utils/searchNavigation";
 import { getReleaseGroupCoverUrl, getReleaseMetric, getReleaseYear } from "../utils";
-import { getAlbumAddButtonLabel } from "../../../utils/albumAddAction";
+import { getAlbumAddAction } from "../../../utils/albumAddAction";
 import { useResponsiveReleaseLimit } from "../hooks/useResponsiveReleaseLimit";
+import Tooltip from "../../../components/Tooltip";
 
 const sortLatest = (items) =>
   [...items].sort((a, b) =>
@@ -23,6 +24,7 @@ export function ArtistDetailsAppearsOn({
   getAlbumStatus,
   canAddAlbum,
   handleRequestAlbum,
+  libraryDestination,
   requestingAlbum,
   artistName,
   onVisibleCoverIdsChange,
@@ -98,20 +100,24 @@ export function ArtistDetailsAppearsOn({
                 )}
                 <div className="artist-release-card__action">
                   {status?.status === "available" || status?.status === "added" ? (
-                    <span className="artist-release-card__status" title="Complete">
-                      <SearchLibraryCheck size="overlay" />
-                      <span className="sr-only">Complete</span>
-                    </span>
+                    <Tooltip content="Complete">
+                      <span className="artist-release-card__status" >
+                        <SearchLibraryCheck size="overlay" />
+                        <span className="sr-only">Complete</span>
+                      </span>
+                    </Tooltip>
                   ) : canAddAlbum ? (
                     <div onClick={(event) => event.stopPropagation()}>
                       <AddActionButton
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          handleRequestAlbum(releaseGroup.id, releaseGroup.title);
-                        }}
+                        {...getAlbumAddAction(
+                          { status: status?.status, managedBy: status?.albumInfo?.managedBy },
+                          libraryDestination,
+                        )}
+                        ownerConflict={status?.ownerConflict}
+                        onAdd={(managedBy) =>
+                          handleRequestAlbum(releaseGroup.id, releaseGroup.title, managedBy)}
                         isLoading={requestingAlbum === releaseGroup.id}
                         disabled={requestingAlbum === releaseGroup.id}
-                        label={getAlbumAddButtonLabel({ status: status?.status })}
                       />
                     </div>
                   ) : null}
@@ -123,11 +129,6 @@ export function ArtistDetailsAppearsOn({
                   .filter(Boolean)
                   .join(" · ")}
               </p>
-              {releaseGroup._appearsOnTrack && (
-                <p className="artist-release-card__meta artist-truncate">
-                  {releaseGroup._appearsOnTrack}
-                </p>
-              )}
               {metric.label && (
                 <p className="artist-release-card__metric">
                   <Star className="artist-star-icon" />

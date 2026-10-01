@@ -65,6 +65,18 @@ test("queue registry survives a Honker database close and reopen", () => {
   assert.equal(queue?.maxAttempts, 3);
 });
 
+test("independent system tasks use isolated queues", () => {
+  assert.equal(honkerDb.getSystemTaskQueueName("inbox-refresh"), "system-task-inbox");
+  assert.equal(honkerDb.getSystemTaskQueueName("news-refresh"), "system-task-maintenance");
+  assert.equal(honkerDb.getSystemTaskQueueName("weekly-flow-refresh"), "system-task-maintenance");
+  assert.equal(honkerDb.getSystemTaskQueueName("import-list-sync"), "system-task");
+  for (const task of honkerDb.SCHEDULED_SYSTEM_TASKS) {
+    if (task.queue.startsWith("system-task")) {
+      assert.equal(task.queue, honkerDb.getSystemTaskQueueName(task.payload.kind));
+    }
+  }
+});
+
 test("Honker uses a low-CPU watcher cadence by default", () => {
   const original = process.env.AURRAL_HONKER_WATCHER_POLL_MS;
   delete process.env.AURRAL_HONKER_WATCHER_POLL_MS;
@@ -101,6 +113,7 @@ test("startup only queues due bootstrap work and a pending migration", () => {
     "weekly-flow-startup-check",
     "discovery-bootstrap",
     "library-index-bootstrap",
+    "release-metadata-refresh",
   ]);
 
   dbOps.setJSONSetting(honkerDb.PLAYLIST_STARTUP_MIGRATION_SETTING, {
@@ -113,5 +126,6 @@ test("startup only queues due bootstrap work and a pending migration", () => {
     "weekly-flow-startup-check",
     "discovery-bootstrap",
     "library-index-bootstrap",
+    "release-metadata-refresh",
   ]);
 });

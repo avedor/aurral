@@ -1,10 +1,12 @@
 import { getData, postData, putData, patchData, deleteData } from "../core.js";
 import { queryClient, queryKeys } from "../../../queryClient.js";
 
+export const fetchHealth = ({ signal } = {}) => getData("/health", { signal });
+
 export const checkHealth = ({ force = false } = {}) =>
   queryClient.fetchQuery({
     queryKey: queryKeys.appHealth,
-    queryFn: ({ signal: querySignal }) => getData("/health", { signal: querySignal }),
+    queryFn: ({ signal: querySignal }) => fetchHealth({ signal: querySignal }),
     staleTime: force ? 0 : 5_000,
   });
 
@@ -39,6 +41,16 @@ export const loginApi = async (username, password) => {
 };
 
 export const exchangeOidcCode = (code) => postData("/auth/oidc/exchange", { code });
+
+export const exchangeGoogleCode = (code) => postData("/auth/google/exchange", { code });
+
+export const startGoogleLink = () => postData("/auth/google/link/start");
+
+export const reauthApi = (currentPassword) => postData("/auth/reauth", { currentPassword });
+
+export const startPlexLoginPin = (forwardUrl) => postData("/auth/plex/login/pin", { forwardUrl });
+
+export const completePlexLogin = () => postData("/auth/plex/login/complete");
 
 export const logoutApi = async () => {
   const result = await postData("/auth/logout");
@@ -104,7 +116,13 @@ export const linkKoito = (token, url) =>
 export const getMyLidarrPreferences = ({ signal } = {}) =>
   getData("/users/me/lidarr-preferences", { signal });
 
+export const getMyLibraryOwner = ({ signal } = {}) =>
+  getData("/users/me/library-owner", { signal });
+
 export const getMyDiscoverLayout = () => getData("/users/me/discover-layout");
+
+export const updateMyLibraryOwner = (defaultLibraryOwner) =>
+  postData("/users/me/library-owner", { defaultLibraryOwner });
 
 export const updateMyListeningHistory = (userId, payload) =>
   patchData(`/users/${userId}`, payload);
@@ -137,6 +155,12 @@ export const linkManagedPlexUser = (userId, plexUserId, { plexUsername, plexUuid
     pin,
   });
 
-export const adminUnlinkPlex = async (userId) => {
-  await deleteData(`/users/${userId}/plex-link`);
+export const adminUnlinkPlex = async (userId, { force = false } = {}) => {
+  await deleteData(`/users/${userId}/plex-link`, force ? { params: { force: true } } : undefined);
+};
+
+export const getMyIdentities = () => getData("/users/me/identities");
+
+export const unlinkMyIdentity = async (identityId) => {
+  await deleteData(`/users/me/identities/${identityId}`);
 };

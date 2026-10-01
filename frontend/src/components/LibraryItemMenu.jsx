@@ -16,7 +16,41 @@ export function LibraryItemSubmenu({
 }) {
   const [internalOpen, setInternalOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState("");
+  const [panelTop, setPanelTop] = useState(0);
+  const panelRef = useRef(null);
+  const correctionFrameRef = useRef(null);
   const open = typeof onToggle === "function" ? isOpen : internalOpen;
+
+  const keepPanelInViewport = useCallback(() => {
+    if (correctionFrameRef.current != null) {
+      window.cancelAnimationFrame(correctionFrameRef.current);
+    }
+    correctionFrameRef.current = window.requestAnimationFrame(() => {
+      correctionFrameRef.current = null;
+      const panel = panelRef.current;
+      if (!panel || window.matchMedia("(max-width: 767px)").matches) return;
+      const edge = 8;
+      const rect = panel.getBoundingClientRect();
+      let adjustment = 0;
+      if (rect.top < edge) adjustment = edge - rect.top;
+      if (rect.bottom + adjustment > window.innerHeight - edge) {
+        adjustment -= rect.bottom + adjustment - (window.innerHeight - edge);
+      }
+      if (adjustment) setPanelTop((current) => current + adjustment);
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    setPanelTop(0);
+    keepPanelInViewport();
+  }, [keepPanelInViewport, open]);
+
+  useEffect(() => () => {
+    if (correctionFrameRef.current != null) {
+      window.cancelAnimationFrame(correctionFrameRef.current);
+    }
+  }, []);
 
   const handleAction = async (event, item) => {
     event.stopPropagation();
@@ -32,7 +66,11 @@ export function LibraryItemSubmenu({
   };
 
   return (
-    <div className={`artist-menu-submenu${open ? " is-open" : ""}`}>
+    <div
+      className={`artist-menu-submenu${open ? " is-open" : ""}`}
+      onPointerEnter={keepPanelInViewport}
+      onFocusCapture={keepPanelInViewport}
+    >
       <button
         type="button"
         className="artist-menu-item artist-menu-submenu__trigger"
@@ -53,11 +91,11 @@ export function LibraryItemSubmenu({
           aria-hidden="true"
         />
       </button>
-      <div className="artist-menu-submenu__panel">
+      <div className="artist-menu-submenu__panel" ref={panelRef} style={{ top: panelTop }}>
         {items.map((item) => {
           const ItemIcon = item.icon;
           const isPending = pendingAction === item.id;
-          const isToggle = typeof item.selected === "boolean";
+          const isToggle = typeof item.selected === "boolean" || typeof item.checked === "boolean";
           return (
             <button
               type="button"
@@ -66,7 +104,7 @@ export function LibraryItemSubmenu({
               key={item.id}
               onClick={(event) => handleAction(event, item)}
               disabled={item.disabled || !!pendingAction}
-              aria-checked={isToggle ? item.selected : undefined}
+              aria-checked={isToggle ? (item.checked ?? item.selected) : undefined}
             >
               <span className="artist-menu-item__main">
                 {isPending ? (
@@ -91,6 +129,13 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
     additionalItemsAfter = "",
     renderAdditionalItems,
     onMenuOpen,
+    triggerIcon = <MoreVertical aria-hidden="true" />,
+    triggerLabel = `${label} options`,
+    triggerClassName = "native-library-item-menu__trigger",
+    menuLabel = `${label} actions`,
+    disabled = false,
+    contextMenu = true,
+    align = "end",
   },
   ref,
 ) {
@@ -118,7 +163,7 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
       registeredCloserRef.current = null;
     }
     if (restoreFocus && ownsActiveMenu) {
-      window.requestAnimationFrame(() => triggerRef.current?.focus());
+      window.requestAnimationFrame(() => triggerRef.current?.focus({ preventScroll: true }));
     }
   }, []);
 
@@ -143,7 +188,7 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
   const openFromTrigger = useCallback(() => {
     const rect = triggerRef.current?.getBoundingClientRect();
     if (!rect) return;
-    openMenu({ kind: "trigger", top: rect.top, right: rect.right, bottom: rect.bottom });
+    openMenu({ kind: "trigger", top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom });
   }, [openMenu]);
 
   const openAt = useCallback(
@@ -154,6 +199,7 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
   useImperativeHandle(ref, () => ({ openAt, close: closeMenu }), [closeMenu, openAt]);
 
   useEffect(() => {
+    if (!contextMenu) return undefined;
     const target = menuRootRef.current?.closest("[data-library-menu-target]");
     if (!target) return undefined;
     const handleContextMenu = (event) => {
@@ -163,7 +209,7 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
     };
     target.addEventListener("contextmenu", handleContextMenu);
     return () => target.removeEventListener("contextmenu", handleContextMenu);
-  }, [openAt]);
+  }, [contextMenu, openAt]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -180,17 +226,26 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
       if (event.key === "Escape") closeMenu();
     };
     const closeOnViewportChange = () => closeMenu(false);
+    const handleScroll = (event) => {
+      if (menuRef.current?.contains(event.target)) return;
+      if (anchor?.kind !== "trigger") {
+        closeMenu(false);
+        return;
+      }
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (rect) setAnchor({ kind: "trigger", top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom });
+    };
     document.addEventListener("pointerdown", handlePointerDown);
     document.addEventListener("keydown", handleEscape);
     window.addEventListener("resize", closeOnViewportChange);
-    window.addEventListener("scroll", closeOnViewportChange, true);
+    window.addEventListener("scroll", handleScroll, true);
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown);
       document.removeEventListener("keydown", handleEscape);
       window.removeEventListener("resize", closeOnViewportChange);
-      window.removeEventListener("scroll", closeOnViewportChange, true);
+      window.removeEventListener("scroll", handleScroll, true);
     };
-  }, [closeMenu, open]);
+  }, [anchor, closeMenu, open]);
 
   useEffect(() => {
     return () => {
@@ -203,7 +258,7 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
 
   useEffect(() => {
     if (!open) return;
-    menuRef.current?.querySelector("button:not(:disabled)")?.focus();
+    menuRef.current?.querySelector("button:not(:disabled)")?.focus({ preventScroll: true });
   }, [open]);
 
   const updatePosition = useCallback(() => {
@@ -213,7 +268,7 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
     const gap = 8;
     const width = menu.offsetWidth;
     const height = menu.offsetHeight;
-    let left = anchor.kind === "context" ? anchor.x : anchor.right - width;
+    let left = anchor.kind === "context" ? anchor.x : align === "start" ? anchor.left : anchor.right - width;
     let top = anchor.kind === "context" ? anchor.y : anchor.bottom + gap;
 
     if (anchor.kind === "trigger" && top + height > window.innerHeight - edge) {
@@ -231,7 +286,7 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
     setPosition((current) =>
       current?.left === left && current?.top === top ? current : { left, top },
     );
-  }, [anchor]);
+  }, [align, anchor]);
 
   useLayoutEffect(() => {
     if (open) updatePosition();
@@ -242,12 +297,36 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
     if (item.disabled || pendingAction) return;
     setPendingAction(item.id);
     try {
+      if (item.closeBeforeSelect) {
+        closeMenu(false);
+        triggerRef.current?.focus({ preventScroll: true });
+        await item.onSelect?.(event);
+        return;
+      }
       await item.onSelect?.(event);
     } catch {
     } finally {
-      closeMenu();
+      if (!item.closeBeforeSelect) closeMenu();
       setPendingAction("");
     }
+  };
+
+  const handleMenuKeyDown = (event) => {
+    const keys = ["ArrowDown", "ArrowUp", "Home", "End"];
+    if (!keys.includes(event.key)) return;
+    const buttons = [...(menuRef.current?.querySelectorAll("button:not(:disabled)") || [])]
+      .filter((button) => button.checkVisibility());
+    if (!buttons.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const current = buttons.indexOf(document.activeElement);
+    const next = {
+      ArrowDown: (current + 1) % buttons.length,
+      ArrowUp: (current - 1 + buttons.length) % buttons.length,
+      Home: 0,
+      End: buttons.length - 1,
+    }[event.key];
+    buttons[next].focus({ preventScroll: true });
   };
 
   const renderItems = () => (
@@ -255,7 +334,21 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
       {items.map((item) => {
         const Icon = item.icon;
         const isPending = pendingAction === item.id;
-        const isToggle = typeof item.selected === "boolean";
+        const isToggle = typeof item.selected === "boolean" || typeof item.checked === "boolean";
+        if (Array.isArray(item.submenuItems)) {
+          return (
+            <div key={item.id}>
+              {item.separatorBefore ? <div className="native-library-item-menu__separator" /> : null}
+              <LibraryItemSubmenu
+                label={item.label}
+                icon={Icon}
+                items={item.submenuItems}
+                onClose={closeMenu}
+              />
+              {item.id === additionalItemsAfter && renderAdditionalItems?.({ closeMenu })}
+            </div>
+          );
+        }
         return (
           <div key={item.id}>
             {item.separatorBefore ? <div className="native-library-item-menu__separator" /> : null}
@@ -265,7 +358,7 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
               className={`artist-menu-item${item.danger ? " artist-menu-item--danger" : ""}${item.selected ? " is-selected" : ""}`}
               onClick={(event) => handleAction(event, item)}
               disabled={item.disabled || !!pendingAction}
-              aria-checked={isToggle ? item.selected : undefined}
+              aria-checked={isToggle ? (item.checked ?? item.selected) : undefined}
             >
               <span className="artist-menu-item__main">
                 {isPending ? (
@@ -290,18 +383,25 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
     <div className="native-library-item-menu" ref={menuRootRef}>
       <TooltipButton
         ref={triggerRef}
-        className={`native-library-item-menu__trigger${open ? " is-open" : ""}`}
-        label={`${label} options`}
-        aria-label={`${label} options`}
+        className={`${triggerClassName}${open ? " is-open" : ""}`}
+        label={triggerLabel}
+        aria-label={triggerLabel}
         aria-haspopup="menu"
         aria-expanded={open}
+        disabled={disabled}
         onClick={(event) => {
           event.stopPropagation();
           if (open) closeMenu();
           else openFromTrigger();
         }}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowDown" || open) return;
+          event.preventDefault();
+          event.stopPropagation();
+          openFromTrigger();
+        }}
       >
-        <MoreVertical aria-hidden="true" />
+        {triggerIcon}
       </TooltipButton>
       {open && position
         ? createPortal(
@@ -309,9 +409,10 @@ export const LibraryItemMenu = forwardRef(function LibraryItemMenu(
               ref={menuRef}
               className={`native-library-item-menu__panel${submenuSide === "left" ? " is-submenu-left" : ""}`}
               role="menu"
-              aria-label={`${label} actions`}
+              aria-label={menuLabel}
               style={{ left: position.left, top: position.top }}
               onClick={(event) => event.stopPropagation()}
+              onKeyDown={handleMenuKeyDown}
             >
               {renderItems()}
             </div>,

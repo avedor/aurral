@@ -3,8 +3,9 @@ import { Ban, Search, X } from "lucide-react";
 import { DotLoader } from "../components/DotLoader";
 import { useArtistTasteFeedback } from "../hooks/useArtistTasteFeedback";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
-import { searchUnified } from "../utils/api/endpoints/search.js";
+import { searchLibrary, searchUnified } from "../utils/api/endpoints/search.js";
 import { buildBlocklistArtistSuggestions } from "../utils/blocklistSearch.js";
+import TooltipButton from "../components/TooltipButton";
 
 const normalizeArtist = (artist) => ({
   id: artist?.id || artist?.mbid || artist?.foreignArtistId || null,
@@ -35,9 +36,20 @@ export default function BlocklistPage() {
     const timer = setTimeout(async () => {
       setSearching(true);
       try {
-        const response = await searchUnified(trimmed, { mode: "suggest", limit: 6 });
+        const [catalog, library] = await Promise.allSettled([
+          searchUnified(trimmed, { mode: "suggest", limit: 6 }),
+          searchLibrary(trimmed, { limit: 6 }),
+        ]);
         if (cancelled) return;
-        setSuggestions(buildBlocklistArtistSuggestions(response));
+        if (catalog.status === "rejected" && library.status === "rejected") {
+          throw catalog.reason;
+        }
+        setSuggestions(
+          buildBlocklistArtistSuggestions({
+            ...(catalog.status === "fulfilled" ? catalog.value : {}),
+            library: library.status === "fulfilled" ? library.value : null,
+          }),
+        );
       } catch {
         if (!cancelled) setSuggestions([]);
       } finally {
@@ -156,7 +168,7 @@ export default function BlocklistPage() {
               return (
                 <div className="blocklist-page__item" key={key}>
                   <span>{entry.artistName || entry.artistId}</span>
-                  <button
+                  <TooltipButton
                     type="button"
                     onClick={() => unblockArtist(entry)}
                     disabled={pendingKey === key}
@@ -169,7 +181,7 @@ export default function BlocklistPage() {
                     ) : (
                       <X className="artist-icon-xs" />
                     )}
-                  </button>
+                  </TooltipButton>
                 </div>
               );
             })}

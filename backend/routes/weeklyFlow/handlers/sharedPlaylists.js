@@ -1,6 +1,7 @@
+import { cleanupBulkOperations, getBulkOperation } from "../../../services/weeklyFlow/weeklyFlowBulkOperationStore.js";
+import { captureSharedPlaylistSelection, getSharedDownloadReferences } from "../../../services/weeklyFlow/weeklyFlowTrackRemoval.js";
 import { randomUUID } from "crypto";
 import { downloadTracker } from "../../../services/weeklyFlow/weeklyFlowDownloadTracker.js";
-import { weeklyFlowWorker } from "../../../services/weeklyFlow/weeklyFlowWorker.js";
 import {
   dedupeSharedTracks,
   flowPlaylistConfig,
@@ -11,6 +12,15 @@ import {
   getAccessibleSharedPlaylist,
 } from "./utils.js";
 import { normalizeImportSource } from "../../../services/weeklyFlow/weeklyFlowPlaylistConfig.js";
+import {
+  markDownloadWorkCancelledForJobs,
+  markPlaylistDownloadWorkCancelled,
+  restoreMarkedPlaylistDownloadWork,
+} from "../../../services/weeklyFlow/weeklyFlowDownloadCancellationService.js";
+import {
+  isDownloadJobCancelled,
+  restoreDownloadJobCancellations,
+} from "../../../services/weeklyFlow/weeklyFlowDownloadCancellation.js";
 
 async function createOrImportSharedPlaylist(req, res, { requireTracks, label }) {
   const {
@@ -59,7 +69,57 @@ async function createOrImportSharedPlaylist(req, res, { requireTracks, label }) 
   });
 }
 
+async function enqueueBulkAction(req, res, action) {
+  const source = getAccessibleSharedPlaylist(req.user, req.params.playlistId);
+  if (!source) return res.status(404).json({ error: "Shared playlist not found" });
+  const { jobIds, target: requestedTarget } = req.body || {};
+  if (!Array.isArray(jobIds) || !jobIds.length || jobIds.some((id) => typeof id !== "string" || !id.trim())) {
+    return res.status(400).json({ error: "jobIds must contain at least one track ID" });
+  }
+  const ids = [...new Set(jobIds.map((id) => id.trim()))];
+  let target = null;
+  if (action === "move") {
+    const playlistId = typeof requestedTarget?.playlistId === "string" ? requestedTarget.playlistId.trim() : "";
+    const name = typeof requestedTarget?.name === "string" ? requestedTarget.name.trim() : "";
+    if (Boolean(playlistId) === Boolean(name)) return res.status(400).json({ error: "Specify a destination playlist ID or name" });
+    if (playlistId === source.id) return res.status(400).json({ error: "Choose a different destination playlist" });
+    if (playlistId && !getAccessibleSharedPlaylist(req.user, playlistId)) return res.status(404).json({ error: "Destination playlist not found" });
+    target = playlistId ? { playlistId } : { playlistId: randomUUID(), name, create: true };
+  }
+  const selections = [];
+  const rejected = [];
+  for (const jobId of ids) {
+    const selection = captureSharedPlaylistSelection(source, jobId);
+    if (selection) selections.push(selection);
+    else rejected.push({ jobId, message: "Track not found in this playlist" });
+  }
+  if (!selections.length) return res.json({ queued: false, acceptedJobIds: [], rejected });
+  const result = await weeklyFlowOperationQueue.enqueueBulkPayload({
+    ownerUserId: req.user.id, sourcePlaylistId: source.id, action, target, selections,
+  });
+  return res.json({ ...result, acceptedJobIds: selections.map((selection) => selection.jobId), rejected });
+}
+
 export function registerSharedPlaylists(router) {
+  for (const [path, action] of [["track-removals", "remove"], ["track-moves", "move"]]) {
+    router.post(`/shared-playlists/:playlistId/${path}`, async (req, res) => {
+      try { return await enqueueBulkAction(req, res, action); }
+      catch (error) { return res.status(500).json({ error: "Failed to queue playlist action", message: error.message }); }
+    });
+  }
+  router.get("/shared-playlists/:playlistId/operations/:operationId", (req, res) => {
+    try {
+      cleanupBulkOperations();
+      const record = getBulkOperation(req.params.operationId);
+      if (!record || record.ownerUserId !== req.user.id || record.sourcePlaylistId !== req.params.playlistId ||
+          !getAccessibleSharedPlaylist(req.user, req.params.playlistId)) {
+        return res.status(404).json({ error: "Playlist operation not found" });
+      }
+      return res.json({ operationId: record.operationId, state: record.state, action: record.action,
+        outcomes: record.outcomes, targetPlaylistId: record.target?.playlistId || null,
+        message: record.message || null });
+    } catch (error) { return res.status(500).json({ error: "Failed to read playlist operation", message: error.message }); }
+  });
   router.post("/shared-playlists", async (req, res) => {
     try {
       return await createOrImportSharedPlaylist(req, res, {
@@ -155,6 +215,20 @@ export function registerSharedPlaylists(router) {
       showTrackAvailability: req.body.enabled,
     });
     return res.json({ success: true, showTrackAvailability: playlist.showTrackAvailability });
+  });
+
+  router.put("/shared-playlists/:playlistId/record-history", (req, res) => {
+    const { playlistId } = req.params;
+    if (!getAccessibleSharedPlaylist(req.user, playlistId)) {
+      return res.status(404).json({ error: "Shared playlist not found" });
+    }
+    if (typeof req.body?.enabled !== "boolean") {
+      return res.status(400).json({ error: "enabled must be a boolean" });
+    }
+    const playlist = flowPlaylistConfig.updateSharedPlaylist(playlistId, {
+      recordHistory: req.body.enabled,
+    });
+    return res.json({ success: true, recordHistory: playlist.recordHistory });
   });
 
   router.put("/shared-playlists/:playlistId", async (req, res) => {
@@ -259,12 +333,25 @@ export function registerSharedPlaylists(router) {
         if (!job || (job.playlistType !== playlistId && !playlistReferencesJob)) {
           return res.status(404).json({ error: "Track not found" });
         }
-        const result = await weeklyFlowOperationQueue.enqueuePayload({
-          kind: "shared-playlist-delete-track",
-          label: `shared-playlist:${playlistId}:track:${jobId}:delete`,
-          playlistId,
-          jobId,
-        });
+        const shouldCancelJob = !playlistReferencesJob && getSharedDownloadReferences(job.id, playlistId).length === 0;
+        const wasJobCancelled = isDownloadJobCancelled(job.id);
+        if (shouldCancelJob) {
+          markDownloadWorkCancelledForJobs([job]);
+        }
+        let result;
+        try {
+          result = await weeklyFlowOperationQueue.enqueuePayload({
+            kind: "shared-playlist-delete-track",
+            label: `shared-playlist:${playlistId}:track:${jobId}:delete`,
+            playlistId,
+            jobId,
+          });
+        } catch (error) {
+          if (shouldCancelJob && !wasJobCancelled) {
+            restoreDownloadJobCancellations([job.id]);
+          }
+          throw error;
+        }
 
         return res.json({
           success: true,
@@ -303,26 +390,6 @@ export function registerSharedPlaylists(router) {
     },
   );
 
-  router.post(
-    "/shared-playlists/:playlistId/research-missing",
-    async (req, res) => {
-      try {
-        const { playlistId } = req.params;
-        const playlist = getAccessibleSharedPlaylist(req.user, playlistId);
-        if (!playlist) {
-          return res.status(404).json({ error: "Shared playlist not found" });
-        }
-        const count = await weeklyFlowWorker.researchMissingTracks(playlistId);
-        res.json({ success: true, playlistId, requeued: count });
-      } catch (error) {
-        res.status(500).json({
-          error: "Failed to re-search missing tracks",
-          message: error.message,
-        });
-      }
-    },
-  );
-
   router.delete("/shared-playlists/:playlistId", async (req, res) => {
     try {
       const { playlistId } = req.params;
@@ -330,12 +397,21 @@ export function registerSharedPlaylists(router) {
       if (!exists) {
         return res.status(404).json({ error: "Shared playlist not found" });
       }
+      const ownedJobs = downloadTracker.getByPlaylistId(playlistId);
+      const retainsDownloads = ownedJobs.some((job) => getSharedDownloadReferences(job.id, playlistId).length > 0);
+      const cancellation = retainsDownloads ? null : markPlaylistDownloadWorkCancelled(playlistId, ownedJobs);
 
-      const deleted = await weeklyFlowOperationQueue.enqueuePayload({
-        kind: "shared-playlist-delete",
-        label: `shared-playlist:${playlistId}:delete`,
-        playlistId,
-      });
+      let deleted;
+      try {
+        deleted = await weeklyFlowOperationQueue.enqueuePayload({
+          kind: "shared-playlist-delete",
+          label: `shared-playlist:${playlistId}:delete`,
+          playlistId,
+        });
+      } catch (error) {
+        if (cancellation) restoreMarkedPlaylistDownloadWork(playlistId, cancellation);
+        throw error;
+      }
       return res.json({
         success: true,
         playlistId,

@@ -19,7 +19,7 @@ const libraryStore = await import("../../backend/services/libraryMediaStore.js")
 const { buildCanonicalLibraryReadModel } = await import(
   "../../backend/services/canonicalLibraryReadAdapter.js"
 );
-const { getCanonicalLibraryPage } = await import(
+const { getCanonicalLibrary, getCanonicalLibraryPage } = await import(
   "../../backend/services/libraryQueryService.js"
 );
 const { computeLibraryRootOverlaps } = await import(
@@ -43,19 +43,49 @@ test("manager state uses canonical ids and round-trips through the store", () =>
   });
   assert.equal(store.getManagedBy("album", 7), "aurral");
   assert.equal(store.getManagedBy("album", "7"), "aurral");
-  assert.deepEqual(store.getLibraryManagementEntry("album", 7), {
-    managedBy: "aurral",
-    monitorMode: "all",
-  });
+  const { updatedAt, ...entry } = store.getLibraryManagementEntry("album", 7);
+  assert.deepEqual(entry, { managedBy: "aurral", monitorMode: "all" });
+  assert.ok(Number.isSafeInteger(updatedAt) && updatedAt > 0);
 
   store.setLibraryManagement({ entityKind: "album", entityId: 7, managedBy: "lidarr" });
-  assert.deepEqual(store.getLibraryManagementEntry("album", 7), {
-    managedBy: "lidarr",
-    monitorMode: null,
-  });
+  const { updatedAt: _updatedAt, ...changedEntry } = store.getLibraryManagementEntry("album", 7);
+  assert.deepEqual(changedEntry, { managedBy: "lidarr", monitorMode: null });
 
   assert.equal(store.clearLibraryManagement("album", 7), true);
   assert.equal(store.getManagedBy("album", 7), null);
+});
+
+test("manager state written by another process is visible without a restart", async () => {
+  const { default: Database } = await import("better-sqlite3");
+  store.setLibraryManagement({ entityKind: "album", entityId: 11, managedBy: "lidarr" });
+  assert.equal(store.getManagedBy("album", 11), "lidarr");
+  assert.equal(store.getManagedBy("album", 12), null);
+
+  const otherProcess = new Database(db.name);
+  try {
+    const now = Date.now() + 1;
+    otherProcess.prepare(
+      `INSERT INTO library_management (entity_kind, entity_id, managed_by, monitor_mode, created_at, updated_at)
+       VALUES ('album', 12, 'aurral', 'monitored', ?, ?)`,
+    ).run(now, now);
+    assert.equal(store.getManagedBy("album", 12), "aurral");
+
+    otherProcess.prepare(
+      "UPDATE library_management SET monitor_mode = 'unmonitored', updated_at = ? WHERE entity_id = 12",
+    ).run(now + 1);
+    assert.equal(store.getLibraryManagementEntry("album", 12).monitorMode, "unmonitored");
+
+    otherProcess.prepare(
+      "UPDATE library_management SET monitor_mode = 'monitored' WHERE entity_id = 12",
+    ).run();
+    assert.equal(store.getLibraryManagementEntry("album", 12).monitorMode, "monitored");
+
+    otherProcess.prepare("DELETE FROM library_management WHERE entity_id = 11").run();
+    assert.equal(store.getManagedBy("album", 11), null);
+  } finally {
+    otherProcess.close();
+    store.clearLibraryManagement("album", 12);
+  }
 });
 
 test("manager state rejects invalid owners, kinds, and ids", () => {
@@ -180,6 +210,34 @@ test("canonical page cache reflects ownership changes without manual invalidatio
   store.clearLibraryManagement("artist", artist.id);
   const cleared = getCanonicalLibraryPage({ kind: "artists", pageSize: 100 });
   assert.equal(cleared.items.find((entry) => String(entry.id) === String(artist.id))?.managedBy, null);
+});
+
+test("canonical library cache reflects ownership changed by another connection", async () => {
+  const { default: Database } = await import("better-sqlite3");
+  const artist = libraryStore.upsertLibraryArtist({
+    identityKey: "mbid:external-cache-artist",
+    mbid: "external-cache-artist",
+    name: "External Cache Artist",
+  });
+  const album = libraryStore.upsertLibraryAlbum({
+    identityKey: "rg:external-cache-album", artistId: artist.id, title: "External Cache Album",
+  });
+  const track = libraryStore.upsertLibraryTrack({
+    identityKey: "rec:external-cache-track", title: "External Cache Track",
+  });
+  libraryStore.linkLibraryAlbumTrack({ albumId: album.id, trackId: track.id, trackNumber: 1 });
+  store.setLibraryManagement({ entityKind: "artist", entityId: artist.id, managedBy: "aurral", monitorMode: "all" });
+  assert.equal(getCanonicalLibrary().artists.find((entry) => entry.id === artist.id).monitorMode, "all");
+
+  const otherConnection = new Database(db.name);
+  try {
+    otherConnection.prepare(
+      "UPDATE library_management SET monitor_mode = 'none' WHERE entity_kind = 'artist' AND entity_id = ?",
+    ).run(artist.id);
+    assert.equal(getCanonicalLibrary().artists.find((entry) => entry.id === artist.id).monitorMode, "none");
+  } finally {
+    otherConnection.close();
+  }
 });
 
 test("root overlap warnings cover equal and nested roots without rejecting", () => {

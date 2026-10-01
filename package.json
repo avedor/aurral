@@ -5,7 +5,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": "22.23.x"
+    "node": "26.9.x"
   },
   "workspaces": [
     "backend",
@@ -15,6 +15,7 @@
     "build": "npm run build --workspace frontend",
     "start": "node --env-file=backend/.env backend/server.js",
     "lint": "npm run lint:backend && npm run lint --workspace frontend",
+    "lint:ui": "npm run lint:ui --workspace frontend",
     "lint:backend": "eslint backend lib --no-config-lookup --rule 'no-unused-vars:[error,{\"argsIgnorePattern\":\"^_\",\"caughtErrors\":\"none\",\"varsIgnorePattern\":\"^_\"}]'",
     "test": "node --test --import ./.tests/setup-env.js --test-concurrency=4 $(find .tests -name '*.test.js' -not -name '*.int.test.js' -print)",
     "test:integration": "node --test --import ./.tests/setup-env.js --test-concurrency=1 $(find .tests -name '*.int.test.js' -print)",
@@ -29,7 +30,6 @@
     "docker:run": "docker run -p 3001:3001 -v $(pwd)/backend/data:/app/backend/data aurral",
     "docs:dev": "npm run dev --prefix docs",
     "docs:build": "npm run build --prefix docs",
-    "site:generate:ascii-logo": "node scripts/video-to-ascii.mjs",
     "hooks:install": "sh scripts/install-git-hooks.sh",
     "prepare": "if [ -d .git ] && [ -f scripts/install-git-hooks.sh ]; then sh scripts/install-git-hooks.sh; fi"
   },
@@ -42,8 +42,7 @@
   "author": "",
   "license": "MIT",
   "overrides": {
-    "brace-expansion": "5.0.9",
-    "react-router": "8.3.1"
+    "brace-expansion": "5.0.9"
   },
   "allowScripts": {
     "bcrypt@6.0.0": true,
@@ -52,6 +51,7 @@
     "sharp@0.34.5": true
   },
   "devDependencies": {
-    "@playwright/test": "^1.63.0"
+    "@playwright/test": "^1.63.0",
+    "ajv": "^8.20.0"
   }
 }

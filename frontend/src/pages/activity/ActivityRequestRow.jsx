@@ -8,10 +8,13 @@ import {
   Play,
   RotateCcw,
   XCircle,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import TooltipButton from "../../components/TooltipButton";
 import { DotLoader } from "../../components/DotLoader";
 import { formatReviewReasonSummary, formatTimelineTime } from "./activityListUtils";
+import Tooltip from "../../components/Tooltip";
 
 function getStatusMeta(request) {
   if (request.status === "completed" || request.status === "available") {
@@ -19,6 +22,9 @@ function getStatusMeta(request) {
   }
   if (request.status === "failed") {
     return { icon: AlertCircle, label: request.statusLabel || "Failed", tone: "failed" };
+  }
+  if (request.status === "cancelled") {
+    return { icon: XCircle, label: request.statusLabel || "Cancelled", tone: "pending" };
   }
   if (request.status === "blocked") {
     return { icon: Eye, label: request.statusLabel || "Needs review", tone: "review" };
@@ -65,6 +71,9 @@ export default function ActivityRequestRow({
   onDeny,
   onPreview,
   onInfo,
+  onToggle,
+  expanded,
+  tracksId,
 }) {
   const isSlskd = request.source === "slskd";
   const isUsenet = request.source === "nzbget" || request.source === "sabnzbd";
@@ -90,7 +99,8 @@ export default function ActivityRequestRow({
     (artistMbid && artistMbid !== "null" && artistMbid !== "undefined");
   const status = getStatusMeta(request);
   const StatusIcon = status.icon;
-  const timelineTime = formatTimelineTime(request.requestedAt);
+  const timelineAt = request.completedAt || request.requestedAt;
+  const timelineTime = formatTimelineTime(timelineAt);
   const canReSearch =
     request.canReSearch === true && request.albumId && !reSearchingAlbumIds[request.albumId];
   const isReSearching = Boolean(request.albumId && reSearchingAlbumIds[request.albumId]);
@@ -118,52 +128,81 @@ export default function ActivityRequestRow({
 
   return (
     <article className="activity-row">
-      <span
-        className={`activity-row__status activity-row__status--${status.tone}`}
-        title={status.label}
-        aria-label={status.label}
-      >
-        {status.spinning ? (
-          <DotLoader size="sm" label={null} />
-        ) : (
-          <StatusIcon aria-hidden="true" />
-        )}
-      </span>
+      <Tooltip content={status.label}>
+        <span
+          className={`activity-row__status activity-row__status--${status.tone}`}
+          aria-label={status.label}
+        >
+          {status.spinning ? (
+            <DotLoader size="sm" label={null} />
+          ) : (
+            <StatusIcon aria-hidden="true" />
+          )}
+        </span>
+      </Tooltip>
       <div className="activity-row__details">
         <h2 className="activity-row__title">
-          {canNavigate ? (
+          {onToggle ? (
             <button
               type="button"
-              className="activity-row__title-button"
-              title={displayTitle}
-              aria-label={`Open ${rowLabel}`}
-              onClick={navigate}
+              className="activity-row__title-button activity-album__toggle"
+              aria-label={`${expanded ? "Collapse" : "Expand"} ${displayTitle}`}
+              aria-expanded={expanded}
+              aria-controls={tracksId}
+              onClick={onToggle}
             >
-              {displayTitle}
+              {expanded ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
+              <span>{displayTitle}</span>
             </button>
+          ) : canNavigate ? (
+            <Tooltip content={displayTitle}>
+              <button
+                type="button"
+                className="activity-row__title-button"
+                aria-label={`Open ${rowLabel}`}
+                onClick={navigate}
+              >
+                {displayTitle}
+              </button>
+            </Tooltip>
           ) : (
             displayTitle
           )}
         </h2>
-        <p className="activity-row__meta" title={displayMeta}>
-          {displayMeta}
-        </p>
-        {reviewReasonSummary ? (
-          <p className="activity-row__hint" title={request.subtitle || reviewReasonSummary}>
-            {reviewReasonSummary}
+        <Tooltip content={displayMeta}>
+          <p className="activity-row__meta" >
+            {displayMeta}
+          </p>
+        </Tooltip>
+        {request.progressLabel ? (
+          <p className="activity-row__hint">
+            {request.statusLabel} · {request.progressLabel}
+            {request.activeStatusLabel ? ` · ${request.activeStatusLabel}` : ""}
           </p>
         ) : null}
+        {request.albumGrab && request.kind === "track_download" && !isBlockedTrack ? (
+          <p className="activity-row__hint">{request.statusLabel}</p>
+        ) : null}
+        {reviewReasonSummary ? (
+          <Tooltip content={request.subtitle || reviewReasonSummary}>
+            <p className="activity-row__hint" >
+              {reviewReasonSummary}
+            </p>
+          </Tooltip>
+        ) : null}
         {request.sourceFilename ? (
-          <p className="activity-row__hint" title={request.sourceFilename}>
-            {request.sourceFilename}
-          </p>
+          <Tooltip content={request.sourceFilename}>
+            <p className="activity-row__hint" >
+              {request.sourceFilename}
+            </p>
+          </Tooltip>
         ) : null}
         {jobError ? <span className="activity-row__error" role="alert">{jobError}</span> : null}
       </div>
       <span className={`activity-row__status-label activity-row__status-label--${status.tone}`}>
         {status.label}
       </span>
-      <time className="activity-row__time" dateTime={request.requestedAt || undefined}>
+      <time className="activity-row__time" dateTime={timelineAt || undefined}>
         {timelineTime}
       </time>
       <div className="activity-row__actions" onClick={(event) => event.stopPropagation()}>

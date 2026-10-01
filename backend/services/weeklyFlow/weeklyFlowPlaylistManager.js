@@ -268,8 +268,8 @@ export class WeeklyFlowPlaylistManager {
     return snapshots;
   }
 
-  async cleanupUserPlexPlaylists(userId) {
-    return this.plexDestination.deleteOwnerPlaylists(userId);
+  async cleanupUserPlexPlaylists(userId, connection = null) {
+    return this.plexDestination.deleteOwnerPlaylists(userId, connection);
   }
 
   async cleanupEntityPlexPlaylists(entityId) {
@@ -322,7 +322,7 @@ export class WeeklyFlowPlaylistManager {
     } catch {}
 
     for (const playlistType of targets) {
-      const jobs = downloadTracker.getByPlaylistType(playlistType);
+      const jobs = downloadTracker.getByPlaylistId(playlistType);
       for (const job of jobs) {
         if (job.downloadClient === "ytdlp") {
           await getDownloadClient("ytdlp").cleanupStaging(job.id);
@@ -349,7 +349,7 @@ export class WeeklyFlowPlaylistManager {
           error.message,
         );
       }
-      downloadTracker.clearByPlaylistType(playlistType);
+      downloadTracker.clearByPlaylistId(playlistType);
       const { repairJobsUnderRemovedPlaylistDir } = await import("./weeklyFlowFileReuse.js");
       const { weeklyFlowWorker } = await import("./weeklyFlowWorker.js");
       const { existingFileMode } = weeklyFlowWorker.getWorkerSettings();

@@ -23,6 +23,7 @@ const {
 const { downloadTracker } = await importFromRepo(
   "backend/services/weeklyFlow/weeklyFlowDownloadTracker.js",
 );
+const { upsertLibraryArtist, upsertLibraryAlbum, upsertLibraryTrack, linkLibraryAlbumTrack } = await importFromRepo("backend/services/libraryMediaStore.js");
 const { getHonkerDb } = await importFromRepo("backend/services/honkerDb.js");
 const { lidarrClient } = await importFromRepo("backend/services/lidarrClient.js");
 
@@ -241,6 +242,33 @@ test("queued library track jobs appear in activity immediately", async () => {
   assert.equal(entry?.trackName, "Queued Song");
 });
 
+test("queued album track jobs open their album, and other library jobs open the library playlist", async () => {
+  const albumMbid = "b2222222-2222-4222-8222-222222222201";
+  const artist = upsertLibraryArtist({ identityKey: "mbid:b1111111-1111-4111-8111-111111111111", mbid: "b1111111-1111-4111-8111-111111111111", name: "Artist" });
+  const album = upsertLibraryAlbum({
+    identityKey: `release-group:${albumMbid}`,
+    mbid: albumMbid,
+    releaseGroupMbid: albumMbid,
+    artistId: artist.id,
+    title: "Album",
+  });
+  const track = upsertLibraryTrack({ identityKey: "recording:b3333333-3333-4333-8333-333333333301", mbid: "b3333333-3333-4333-8333-333333333301", title: "One", artistName: "Artist" });
+  linkLibraryAlbumTrack({ albumId: album.id, trackId: track.id, trackNumber: 1 });
+  const withAlbum = downloadTracker.addJob({ artistName: "Artist", trackName: "One", albumName: "Album", albumMbid, trackMbid: "t1" }, "library");
+  const withoutAlbum = downloadTracker.addJob({ artistName: "Artist", trackName: "Two", albumName: "Loose", trackMbid: "t2" }, "library");
+  recordTrackJobQueued(downloadTracker.getJob(withAlbum));
+  recordTrackJobQueued(downloadTracker.getJob(withoutAlbum));
+
+  const entries = await getAurralHistoryRequests();
+  assert.equal(entries.find((item) => item.jobId === withAlbum)?.href, `/library/album/${album.id}`);
+  assert.equal(entries.find((item) => item.jobId === withoutAlbum)?.href, "/playlists?selected=library");
+
+  const { finalizeQualityUpgradeFailure } = await importFromRepo("backend/services/qualityProfileService.js");
+  await finalizeQualityUpgradeFailure({ id: "upgrade-of-one", upgradeForJobId: withAlbum }, "No better file");
+  const upgrade = (await getAurralHistoryRequests()).find((item) => item.jobId === "upgrade-of-one");
+  assert.equal(upgrade?.href, `/library/album/${album.id}`);
+});
+
 test("pending tracker jobs without history appear in activity immediately", async () => {
   const jobId = downloadTracker.addJob(
     {
@@ -391,4 +419,83 @@ test("blocked track download history falls back to staging basename", async () =
   const entry = entries.find((item) => item.jobId === jobId);
 
   assert.equal(entry?.sourceFilename, "downloaded-track.mp3");
+});
+
+test("cancelled album track downloads show as cancelled, never as failed", async () => {
+  const { cancelDownloadJobs } = await importFromRepo(
+    "backend/services/weeklyFlow/weeklyFlowDownloadCancellation.js",
+  );
+  const jobId = downloadTracker.addJob(
+    {
+      artistName: "Artist",
+      trackName: "Cancelled Song",
+      albumName: "Album",
+      managedBy: "aurral",
+      requestGroupId: "cancelled-history-group",
+    },
+    "library",
+  );
+  upsertAurralHistory({
+    referenceId: jobId,
+    kind: "track_download",
+    title: "Downloading Cancelled Song",
+    subtitle: "Artist · Library",
+    status: "processing",
+    statusLabel: "Downloading",
+    metadata: {
+      jobId,
+      trackName: "Cancelled Song",
+      artistName: "Artist",
+      playlistId: "library",
+      downloadSource: "slskd",
+    },
+    createdAt: Date.now() - 20 * 60 * 1000,
+  });
+  downloadTracker.setDownloading(jobId);
+  cancelDownloadJobs([jobId]);
+  downloadTracker.setCancelled(jobId);
+  const job = downloadTracker.getJob(jobId);
+  job.createdAt = Date.now() - 20 * 60 * 1000;
+  job.startedAt = job.createdAt;
+
+  const entry = (await getAurralHistoryRequests()).find((item) => item.jobId === jobId);
+
+  assert.equal(entry?.status, "cancelled");
+  assert.equal(entry?.statusLabel, "Cancelled");
+  assert.equal(entry?.inQueue, false);
+  assert.equal(downloadTracker.getJob(jobId)?.status, "cancelled");
+});
+
+test("Aurral album requests are not checked against Lidarr by canonical album ID", async (t) => {
+  const lidarrAlbumLookups = [];
+  const lidarrStub = {
+    isConfigured: () => true,
+    getQueue: async () => [],
+    getHistory: async () => ({ records: [] }),
+    request: async () => [],
+    getAlbum: async (id) => {
+      lidarrAlbumLookups.push(String(id));
+      return null;
+    },
+  };
+  historyModule.recordAlbumRequested({
+    albumId: "4242",
+    albumName: "Aurral Owned Album",
+    artistName: "Artist",
+    managedBy: "aurral",
+    searching: true,
+  });
+  historyModule.recordAlbumRequested({
+    albumId: "4343",
+    albumName: "Lidarr Album",
+    artistName: "Artist",
+    searching: true,
+  });
+
+  const entries = await getAurralHistoryRequests(lidarrStub);
+
+  assert.deepEqual(lidarrAlbumLookups, ["4343"]);
+  const aurralEntry = entries.find((item) => item.albumName === "Aurral Owned Album");
+  assert.notEqual(aurralEntry?.status, "failed");
+  assert.doesNotMatch(aurralEntry?.title || "", /Lidarr/);
 });

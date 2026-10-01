@@ -1,23 +1,57 @@
 import path from "node:path";
 import createHonkerWorker from "./honkerWorkerFactory.js";
-import { db } from "../config/db-sqlite.js";
+import { db, dbHelpers } from "../config/db-sqlite.js";
 import { dbOps } from "../db/helpers/index.js";
 import { enqueueLibraryScanJob, getLibraryScanQueue } from "./honkerDb.js";
 import { isHonkerDatabaseClosedError } from "./honkerWorkerRuntime.js";
 import { resolveLibraryScanChangedPaths } from "./libraryScanRequest.js";
+import { scheduleReleaseMetadataRefresh } from "./releaseMetadataSync.js";
 import { websocketService } from "./websocketService.js";
 
 const WORKER_NAME = "library-scan";
 const LIBRARY_SCAN_REGISTRY_KEY = "pendingLibraryScanJob";
 const MAX_CHANGED_PATHS = 4096;
+const scanRegistryValueStmt = db.prepare("SELECT value FROM settings WHERE key = ?");
+const insertScanRegistryStmt = db.prepare(
+  "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+);
+const updateScanRegistryStmt = db.prepare(
+  "UPDATE settings SET value = ? WHERE key = ? AND value = ?",
+);
+
+function getScanRegistrySnapshot() {
+  const value = scanRegistryValueStmt.get(LIBRARY_SCAN_REGISTRY_KEY)?.value ?? null;
+  const raw = dbHelpers.parseJSON(value);
+  return {
+    value,
+    registry: raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {},
+  };
+}
 
 function getScanRegistry() {
-  const raw = dbOps.getJSONSetting(LIBRARY_SCAN_REGISTRY_KEY);
-  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  return getScanRegistrySnapshot().registry;
 }
 
 function setScanRegistry(registry) {
   dbOps.setJSONSetting(LIBRARY_SCAN_REGISTRY_KEY, registry);
+}
+
+function setScanRegistryIfUnchanged(snapshot, registry) {
+  const value = dbHelpers.stringifyJSON(registry);
+  return snapshot.value === null
+    ? insertScanRegistryStmt.run(LIBRARY_SCAN_REGISTRY_KEY, value).changes === 1
+    : updateScanRegistryStmt.run(value, LIBRARY_SCAN_REGISTRY_KEY, snapshot.value).changes === 1;
+}
+
+function withoutScheduledScan(registry) {
+  const nextRegistry = { ...registry };
+  for (const key of [
+    "jobId", "includeLidarr", "force", "changedPaths", "inFlightActive",
+    "inFlightPaths", "fullRescanPending",
+  ]) {
+    delete nextRegistry[key];
+  }
+  return nextRegistry;
 }
 
 function normalizeJobId(value) {
@@ -69,17 +103,13 @@ export function hasCompletedLibraryScan() {
 }
 
 export function clearScheduledLibraryScan(jobId = null) {
-  const registry = getScanRegistry();
-  if (!("jobId" in registry)) return;
-  if (jobId != null && Number(registry.jobId) !== Number(jobId)) return;
-  delete registry.jobId;
-  delete registry.includeLidarr;
-  delete registry.force;
-  delete registry.changedPaths;
-  delete registry.inFlightActive;
-  delete registry.inFlightPaths;
-  delete registry.fullRescanPending;
-  setScanRegistry(registry);
+  while (true) {
+    const snapshot = getScanRegistrySnapshot();
+    const registry = snapshot.registry;
+    if (!("jobId" in registry)) return;
+    if (jobId != null && Number(registry.jobId) !== Number(jobId)) return;
+    if (setScanRegistryIfUnchanged(snapshot, withoutScheduledScan(registry))) return;
+  }
 }
 
 export function scheduleLibraryScan({
@@ -87,43 +117,49 @@ export function scheduleLibraryScan({
   includeLidarr = true,
   changedPaths = null,
 } = {}) {
-  const registry = getScanRegistry();
+  const snapshot = getScanRegistrySnapshot();
+  const registry = snapshot.registry;
   const requestedPaths = normalizeChangedPaths(changedPaths);
   const fullScanRequested = force === true || requestedPaths === null;
   const existingJobId = normalizeJobId(registry.jobId);
   if (existingJobId != null && hasLiveScanJob(existingJobId)) {
-    const nextRegistry = { ...registry };
-    if (includeLidarr === true) nextRegistry.includeLidarr = true;
-    if (force === true) nextRegistry.force = true;
-    if (registry.inFlightActive === true) {
-      if (fullScanRequested) {
-        nextRegistry.changedPaths = [];
-        nextRegistry.fullRescanPending = true;
-      } else if (nextRegistry.fullRescanPending !== true) {
-        const mergedPaths = mergeChangedPaths(nextRegistry.changedPaths, requestedPaths);
-        if (mergedPaths === null) {
+    const updated = db.transaction(() => {
+      const current = getScanRegistry();
+      if (normalizeJobId(current.jobId) !== existingJobId) return false;
+      const nextRegistry = { ...current };
+      if (includeLidarr === true) nextRegistry.includeLidarr = true;
+      if (force === true) nextRegistry.force = true;
+      if (current.inFlightActive === true) {
+        if (fullScanRequested) {
           nextRegistry.changedPaths = [];
           nextRegistry.fullRescanPending = true;
-        } else {
-          nextRegistry.changedPaths = mergedPaths;
+        } else if (nextRegistry.fullRescanPending !== true) {
+          const mergedPaths = mergeChangedPaths(nextRegistry.changedPaths, requestedPaths);
+          if (mergedPaths === null) {
+            nextRegistry.changedPaths = [];
+            nextRegistry.fullRescanPending = true;
+          } else {
+            nextRegistry.changedPaths = mergedPaths;
+          }
         }
+      } else if (fullScanRequested) {
+        delete nextRegistry.changedPaths;
+      } else if (Array.isArray(nextRegistry.changedPaths)) {
+        const mergedPaths = mergeChangedPaths(nextRegistry.changedPaths, requestedPaths);
+        if (mergedPaths === null) delete nextRegistry.changedPaths;
+        else nextRegistry.changedPaths = mergedPaths;
       }
-    } else if (fullScanRequested) {
-      delete nextRegistry.changedPaths;
-    } else if (Array.isArray(nextRegistry.changedPaths)) {
-      const mergedPaths = mergeChangedPaths(nextRegistry.changedPaths, requestedPaths);
-      if (mergedPaths === null) delete nextRegistry.changedPaths;
-      else nextRegistry.changedPaths = mergedPaths;
-    }
-    setScanRegistry(nextRegistry);
-    return existingJobId;
+      setScanRegistry(nextRegistry);
+      return true;
+    }).immediate();
+    if (updated) return existingJobId;
+    return scheduleLibraryScan({ force, includeLidarr, changedPaths });
   }
   const recoveredPaths = registry.inFlightActive === true && Array.isArray(registry.inFlightPaths)
     ? registry.inFlightPaths
     : null;
   const recoveredFullScan = registry.inFlightActive === true && !Array.isArray(registry.inFlightPaths);
   const recoveredForce = registry.force === true;
-  if (existingJobId != null) clearScheduledLibraryScan(existingJobId);
   const mustRunFullScan = fullScanRequested ||
     recoveredFullScan ||
     registry.fullRescanPending === true;
@@ -136,59 +172,146 @@ export function scheduleLibraryScan({
         ...(Array.isArray(requestedPaths) ? requestedPaths : []),
       ]);
   const fullScan = mustRunFullScan || effectivePaths === null;
+  const effectiveIncludeLidarr = includeLidarr === true ||
+    (existingJobId != null && registry.includeLidarr === true);
   const jobId = enqueueLibraryScanJob({
     force: effectiveForce,
-    includeLidarr: includeLidarr === true,
+    includeLidarr: effectiveIncludeLidarr,
+    changedPaths: fullScan ? null : effectivePaths,
   });
-  const nextRegistry = { jobId, includeLidarr: includeLidarr === true };
+  const nextRegistry = { jobId, includeLidarr: effectiveIncludeLidarr };
   if (effectiveForce) nextRegistry.force = true;
   if (!fullScan) nextRegistry.changedPaths = effectivePaths;
-  setScanRegistry(nextRegistry);
+  if (!setScanRegistryIfUnchanged(snapshot, nextRegistry)) {
+    if (getScheduledLibraryScanJobId() === jobId && hasLiveScanJob(jobId)) {
+      return scheduleLibraryScan({ force, includeLidarr, changedPaths });
+    }
+    getLibraryScanQueue().cancel(jobId);
+    return scheduleLibraryScan({ force, includeLidarr, changedPaths });
+  }
   return jobId;
 }
 
-export function claimScheduledLibraryScanJob(jobId) {
+export function claimScheduledLibraryScanJob(jobId, jobPayload = null) {
   const normalizedJobId = normalizeJobId(jobId);
   if (normalizedJobId == null) return false;
-  const registry = getScanRegistry();
-  const scheduledJobId = getScheduledLibraryScanJobId();
+  const rawPayload = jobPayload ?? getLibraryScanQueue().getJob(normalizedJobId)?.payload;
+  let payload = rawPayload;
+  if (typeof rawPayload === "string") {
+    try { payload = JSON.parse(rawPayload); } catch { payload = {}; }
+  }
+  const scheduledJobId = normalizeJobId(getScanRegistry().jobId);
   if (scheduledJobId != null && scheduledJobId !== normalizedJobId) {
     if (hasLiveScanJob(scheduledJobId)) return false;
-    clearScheduledLibraryScan(scheduledJobId);
   }
-  const nextRegistry = {
-    jobId: normalizedJobId,
-    includeLidarr:
-      Number(registry.jobId) === normalizedJobId && registry.includeLidarr === true,
-  };
-  if (Number(registry.jobId) === normalizedJobId) {
-    for (const key of ["force", "changedPaths", "inFlightActive", "inFlightPaths", "fullRescanPending"]) {
-      if (key in registry) nextRegistry[key] = registry[key];
+  return db.transaction(() => {
+    const registry = getScanRegistry();
+    const currentJobId = normalizeJobId(registry.jobId);
+    if (currentJobId !== scheduledJobId && currentJobId !== normalizedJobId) return false;
+    const isCurrentJob = currentJobId === normalizedJobId;
+    const nextRegistry = { jobId: normalizedJobId, includeLidarr: false };
+    if (isCurrentJob) {
+      nextRegistry.includeLidarr = registry.includeLidarr === true;
+      for (const key of ["force", "changedPaths", "inFlightActive", "inFlightPaths", "fullRescanPending"]) {
+        if (key in registry) nextRegistry[key] = registry[key];
+      }
+    } else {
+      const hasRecoveryState = currentJobId != null ||
+        Array.isArray(registry.changedPaths) || registry.inFlightActive === true ||
+        registry.fullRescanPending === true || registry.force === true;
+      nextRegistry.includeLidarr = payload?.includeLidarr === true ||
+        (hasRecoveryState && registry.includeLidarr === true);
+      if (payload?.force === true || (hasRecoveryState && registry.force === true)) {
+        nextRegistry.force = true;
+      }
+      const oldFullScan = hasRecoveryState && (
+        registry.fullRescanPending === true ||
+        (registry.inFlightActive === true && !Array.isArray(registry.inFlightPaths)) ||
+        (currentJobId != null && registry.inFlightActive !== true && !Array.isArray(registry.changedPaths))
+      );
+      if (!oldFullScan && Array.isArray(payload?.changedPaths)) {
+        nextRegistry.changedPaths = normalizeChangedPaths([
+          ...(Array.isArray(registry.inFlightPaths) ? registry.inFlightPaths : []),
+          ...(Array.isArray(registry.changedPaths) ? registry.changedPaths : []),
+          ...payload.changedPaths,
+        ]);
+      }
     }
-  }
-  setScanRegistry(nextRegistry);
-  return true;
+    setScanRegistry(nextRegistry);
+    return true;
+  }).immediate();
 }
 
 export function onLibraryScanSuccess(_payload, job) {
-  const registry = getScanRegistry();
-  if (Number(registry.jobId) !== Number(job.id)) return;
-  const pendingFullScan = registry.fullRescanPending === true;
-  const pendingPaths = Array.isArray(registry.changedPaths) ? registry.changedPaths : [];
-  const includeLidarr = registry.includeLidarr === true;
-  const force = registry.force === true;
-  clearScheduledLibraryScan(job.id);
-  if (pendingFullScan || pendingPaths.length > 0) {
+  const pending = db.transaction(() => {
+    const registry = getScanRegistry();
+    if (Number(registry.jobId) !== Number(job.id)) return null;
+    const result = {
+      fullScan: registry.fullRescanPending === true,
+      paths: Array.isArray(registry.changedPaths) ? registry.changedPaths : [],
+      includeLidarr: registry.includeLidarr === true,
+      force: registry.force === true,
+    };
+    setScanRegistry(withoutScheduledScan(registry));
+    return result;
+  }).immediate();
+  if (pending && (pending.fullScan || pending.paths.length > 0)) {
     scheduleLibraryScan({
-      force,
-      includeLidarr,
-      changedPaths: pendingFullScan ? null : pendingPaths,
+      force: pending.force,
+      includeLidarr: pending.includeLidarr,
+      changedPaths: pending.fullScan ? null : pending.paths,
     });
   }
+  scheduleReleaseMetadataRefresh({ delaySeconds: 5 });
+}
+
+export function beginLibraryScanJob(jobId, payload) {
+  return db.transaction(() => {
+    const registry = getScanRegistry();
+    const isCurrentJob = Number(registry.jobId) === Number(jobId);
+    const includeLidarr = payload?.includeLidarr === true ||
+      (isCurrentJob && registry.includeLidarr === true);
+    const force = payload?.force === true ||
+      (isCurrentJob && registry.force === true);
+    const changedPaths = resolveLibraryScanChangedPaths(registry, force);
+    if (isCurrentJob) {
+      setScanRegistry({
+        ...registry,
+        changedPaths: [],
+        inFlightActive: true,
+        inFlightPaths: changedPaths,
+        fullRescanPending: false,
+      });
+    }
+    return { includeLidarr, force, changedPaths };
+  }).immediate();
 }
 
 export function onLibraryScanFinalFailure(job) {
   clearScheduledLibraryScan(job.id);
+}
+
+export function restoreLibraryScanAfterWorkerExit(jobId) {
+  db.transaction(() => {
+    const registry = getScanRegistry();
+    if (Number(registry.jobId) !== Number(jobId)) return;
+    const active = registry.inFlightActive === true;
+    const fullScan = registry.fullRescanPending === true ||
+      (active && !Array.isArray(registry.inFlightPaths)) ||
+      (!active && !("changedPaths" in registry));
+    const nextRegistry = {
+      jobId,
+      includeLidarr: registry.includeLidarr === true,
+    };
+    if (registry.force === true) nextRegistry.force = true;
+    if (!fullScan) {
+      nextRegistry.changedPaths = mergeChangedPaths(
+        registry.changedPaths,
+        registry.inFlightPaths,
+      );
+    }
+    setScanRegistry(nextRegistry);
+  }).immediate();
 }
 
 export function getLibraryScanStatus(jobId) {
@@ -233,29 +356,14 @@ const {
   idlePollS: 10,
   retryDelayS: 60,
   filterJob(job) {
-    return claimScheduledLibraryScanJob(job.id);
+    return claimScheduledLibraryScanJob(job.id, job.payload);
   },
   processJob: async (payload, job) => {
     const { lidarrClient } = await import("./lidarrClient.js");
     const { scanConfiguredLibrary } = await import("./libraryIndexService.js");
     const { retryPlaybackRetainedFiles } = await import("./playback/playbackFileRetention.js");
     await retryPlaybackRetainedFiles();
-    const registry = getScanRegistry();
-    const includeLidarr =
-      payload?.includeLidarr === true ||
-      (Number(registry.jobId) === Number(job.id) && registry.includeLidarr === true);
-    const force = payload?.force === true ||
-      (Number(registry.jobId) === Number(job.id) && registry.force === true);
-    const changedPaths = resolveLibraryScanChangedPaths(registry, force);
-    if (Number(registry.jobId) === Number(job.id)) {
-      setScanRegistry({
-        ...registry,
-        changedPaths: [],
-        inFlightActive: true,
-        inFlightPaths: changedPaths,
-        fullRescanPending: false,
-      });
-    }
+    const { includeLidarr, force, changedPaths } = beginLibraryScanJob(job.id, payload);
     const scanResult = await scanConfiguredLibrary({
       lidarrClient,
       includeLidarr,
@@ -274,23 +382,7 @@ const {
     if (job.attempts >= 3) {
       return { action: "fail", message };
     }
-    const registry = getScanRegistry();
-    const active = registry.inFlightActive === true;
-    const fullScan = registry.fullRescanPending === true ||
-      (active && !Array.isArray(registry.inFlightPaths)) ||
-      (!active && !("changedPaths" in registry));
-    const nextRegistry = {
-      jobId: job.id,
-      includeLidarr: registry.includeLidarr === true,
-    };
-    if (registry.force === true) nextRegistry.force = true;
-    if (!fullScan) {
-      nextRegistry.changedPaths = mergeChangedPaths(
-        registry.changedPaths,
-        registry.inFlightPaths,
-      );
-    }
-    setScanRegistry(nextRegistry);
+    restoreLibraryScanAfterWorkerExit(job.id);
     return { action: "retry", delayS: 60, message };
   },
   onJobSuccess: onLibraryScanSuccess,

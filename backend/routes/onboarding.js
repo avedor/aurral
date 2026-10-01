@@ -112,15 +112,15 @@ router.post("/complete", async (req, res) => {
       }
     }
 
-    if (!lidarr?.url || !lidarr?.apiKey) {
+    const connectLidarr = lidarr != null;
+    if (connectLidarr && (!lidarr.url || !lidarr.apiKey)) {
       return res.status(400).json({
-        error: "Lidarr is required",
-        message: "Connect Lidarr before finishing setup.",
+        error: "Lidarr connection is incomplete",
+        message: "Enter both the Lidarr URL and API key, or skip Lidarr for now.",
       });
     }
 
     const current = dbOps.getSettings();
-    const profiles = await resolveLidarrProfiles(lidarr);
     const integrations = {
       ...(current.integrations || defaultData.settings.integrations || {}),
       general: {
@@ -134,7 +134,11 @@ router.post("/complete", async (req, res) => {
             ? String(authPassword)
             : current.integrations?.general?.authPassword || "",
       },
-      lidarr: {
+    };
+
+    if (connectLidarr) {
+      const profiles = await resolveLidarrProfiles(lidarr);
+      integrations.lidarr = {
         ...(current.integrations?.lidarr || {}),
         ...lidarr,
         url: stripTrailingSlashes(String(lidarr.url).trim()),
@@ -146,8 +150,8 @@ router.post("/complete", async (req, res) => {
             ? String(lidarr.defaultMonitorOption)
             : current.integrations?.lidarr?.defaultMonitorOption || "none",
         searchOnAdd: lidarr.searchOnAdd === true,
-      },
-    };
+      };
+    }
 
     const nextSettings = {
       ...current,
@@ -180,7 +184,15 @@ router.post("/complete", async (req, res) => {
     const authPasswordFinal = integrations?.general?.authPassword || "";
     if (authPasswordFinal && userOps.getAllUsers().length === 0) {
       const hash = hashPassword(authPasswordFinal);
-      userOps.createUser(authUserFinal, hash, "admin", null, authPasswordFinal);
+      userOps.createUser(
+        authUserFinal,
+        hash,
+        "admin",
+        null,
+        true,
+        true,
+        authPasswordFinal,
+      );
     }
 
     reconcileLocalNetworkBypassSetting();

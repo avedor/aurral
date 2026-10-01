@@ -1,3 +1,4 @@
+import cors from "cors";
 import express from "express";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
@@ -10,7 +11,9 @@ import dns from "node:dns";
 dns.setDefaultResultOrder("ipv4first");
 
 import { authMiddleware, isProxyAuthEnabled } from "./middleware/auth.js";
+import { createRequestFailureLogger } from "./middleware/requestFailureLogger.js";
 import { handleOidcCallback, isOidcEnabled } from "./services/oidcAuth.js";
+import { handleGoogleCallback } from "./services/googleAuth.js";
 import { logger } from "./services/logger.js";
 import { websocketService } from "./services/websocketService.js";
 import {
@@ -71,38 +74,17 @@ const isSubsonicRequest = (req) => req.path === "/rest" || req.path.startsWith("
 const isImageProxyRequest = (req) =>
   req.path === "/api/image-proxy" || req.path.startsWith("/api/image-proxy/");
 
+const corsDefaults = {
+  methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
+  allowedHeaders: "Content-Type, Authorization",
+};
+const publicCors = cors(corsDefaults);
+const apiCors = cors({ ...corsDefaults, origin: allowedCorsOrigins });
+
 function corsMiddleware(req, res, next) {
-  if (isSubsonicRequest(req) || isImageProxyRequest(req)) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    if (req.method === "OPTIONS") {
-      res.status(204).end();
-      return;
-    }
-    next();
-    return;
-  }
-  if (allowedCorsOrigins.length === 0) {
-    if (req.method === "OPTIONS") {
-      res.status(403).end();
-      return;
-    }
-    next();
-    return;
-  }
-  const origin = req.headers.origin;
-  if (origin && allowedCorsOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
-  res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") {
-    res.status(origin && allowedCorsOrigins.includes(origin) ? 204 : 403).end();
-    return;
-  }
-  next();
+  if (isSubsonicRequest(req) || isImageProxyRequest(req)) return publicCors(req, res, next);
+  if (allowedCorsOrigins.length > 0) return apiCors(req, res, next);
+  return next();
 }
 
 const trustProxyValue =
@@ -142,6 +124,7 @@ if (process.env.OIDC_DOMAIN) {
 }
 
 app.use(corsMiddleware);
+app.use(createRequestFailureLogger());
 app.use(
   helmet({
     contentSecurityPolicy: {
@@ -211,7 +194,7 @@ app.use("/api/auth", authRouter);
 app.use("/api/scrobbling", scrobblingRouter);
 app.use("/api/play-events", playEventsRouter);
 app.use("/api/image-proxy", imageProxyRouter);
-app.use("/rest", subsonicRouter);
+app.use("/rest", express.urlencoded({ extended: false }), subsonicRouter);
 
 app.get("/sso/callback", async (req, res) => {
   try {
@@ -222,6 +205,18 @@ app.get("/sso/callback", async (req, res) => {
     logger.error("auth", "OIDC callback failed:", { message: error.message });
     const message = encodeURIComponent(error.message || "OIDC login failed");
     res.redirect(302, `/sso/complete#error=${message}`);
+  }
+});
+
+app.get("/sso/google/callback", async (req, res) => {
+  try {
+    const result = await handleGoogleCallback(req);
+    const code = encodeURIComponent(result.code);
+    res.redirect(302, `/sso/complete#code=${code}&provider=google`);
+  } catch (error) {
+    logger.error("auth", "Google callback failed:", { message: error.message });
+    const message = encodeURIComponent(error.message || "Google login failed");
+    res.redirect(302, `/sso/complete#error=${message}&provider=google`);
   }
 });
 
@@ -251,7 +246,7 @@ if (fs.existsSync(frontendDist)) {
     if (req.path.startsWith("/api")) {
       return res.status(404).json({ error: "Not found" });
     }
-    res.sendFile(path.join(frontendDist, "index.html"));
+    res.sendFile("index.html", { root: frontendDist });
   });
 } else {
   app.get(frontendFallbackRoute, (req, res) => {
@@ -264,6 +259,7 @@ if (fs.existsSync(frontendDist)) {
 
 app.use((err, req, res, next) => {
   logger.error("system", "Express error:", err || "(no error object)");
+  res.locals.failureLogged = true;
   if (res.headersSent) return next(err);
   if (err?.type === "entity.too.large" || err?.status === 413) {
     return res.status(413).json({

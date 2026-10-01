@@ -5,6 +5,7 @@ import {
   ArrowUpCircle,
   CheckCircle2,
   Info,
+  ListFilter,
   RotateCcw,
   Search,
 } from "lucide-react";
@@ -12,7 +13,7 @@ import { DotLoader } from "../../components/DotLoader";
 import TooltipButton from "../../components/TooltipButton";
 import { useToast } from "../../contexts/ToastContext";
 import { formatDateTime } from "../../utils/dateTime.js";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router";
 import { PageSectionMobileNav } from "../../components/PageSectionMobileNav";
 import {
   getAllFlowJobs,
@@ -27,12 +28,14 @@ import { usePlaylistStatusQuery } from "../flows/usePlaylistStatusQuery.js";
 import { buildWantedPath, WANTED_VIEWS } from "../../navigation/activityNavConfig";
 import ActivityToolbar from "./ActivityToolbar";
 import ActivityInfoModal from "./ActivityInfoModal";
+import ManualMissingSearchModal from "./ManualMissingSearchModal";
 import {
   getMissingJobKey,
   isCutoffUnmetAurralJob,
   isMissingAurralJob,
   sortMissingJobs,
 } from "./activityMissingUtils.js";
+import Tooltip from "../../components/Tooltip";
 
 const WANTED_PAGE_SIZE = 25;
 
@@ -68,7 +71,7 @@ const formatJobDate = (value) => {
   });
 };
 
-function MissingJobRow({ job, playlist, actionState, onAction, onInfo }) {
+function MissingJobRow({ job, playlist, actionState, onAction, onInfo, onManualSearch }) {
   const isMissing = isMissingAurralJob(job);
   const isWorking = actionState === "working";
   const isQueued = actionState === "queued";
@@ -90,23 +93,30 @@ function MissingJobRow({ job, playlist, actionState, onAction, onInfo }) {
 
   return (
     <article className="activity-row">
-      <span
-        className={`activity-row__status activity-row__status--${isMissing ? "failed" : "pending"}`}
-        title={statusLabel}
-        aria-label={statusLabel}
-      >
-        <StatusIcon aria-hidden="true" />
-      </span>
+      <Tooltip content={statusLabel}>
+        <span
+          className={`activity-row__status activity-row__status--${isMissing ? "failed" : "pending"}`}
+          aria-label={statusLabel}
+        >
+          <StatusIcon aria-hidden="true" />
+        </span>
+      </Tooltip>
       <div className="activity-row__details">
-        <h2 className="activity-row__title" title={job.trackName || "Unknown track"}>
-          {job.trackName || "Unknown track"}
-        </h2>
-        <p className="activity-row__meta" title={meta}>
-          {meta}
-        </p>
-        <p className="activity-row__hint" title={job.error || hint}>
-          {hint}
-        </p>
+        <Tooltip content={job.trackName || "Unknown track"}>
+          <h2 className="activity-row__title" >
+            {job.trackName || "Unknown track"}
+          </h2>
+        </Tooltip>
+        <Tooltip content={meta}>
+          <p className="activity-row__meta" >
+            {meta}
+          </p>
+        </Tooltip>
+        <Tooltip content={job.error || hint}>
+          <p className="activity-row__hint" >
+            {hint}
+          </p>
+        </Tooltip>
       </div>
       <span className={`activity-row__status-label activity-row__status-label--${isMissing ? "failed" : "pending"}`}>
         {statusLabel}
@@ -115,6 +125,16 @@ function MissingJobRow({ job, playlist, actionState, onAction, onInfo }) {
         {formatJobDate(job.createdAt)}
       </time>
       <div className="activity-row__actions">
+        {isMissing ? (
+          <TooltipButton
+            className="native-library-icon-button"
+            onClick={() => onManualSearch(job)}
+            disabled={isWorking}
+            label="Choose a download manually"
+          >
+            <ListFilter aria-hidden="true" />
+          </TooltipButton>
+        ) : null}
         <TooltipButton
           className="native-library-icon-button"
           onClick={() => onAction(job)}
@@ -153,6 +173,7 @@ export default function ActivityMissingPage() {
   const [searchParams] = useSearchParams();
   const { showError, showSuccess } = useToast();
   const [infoJob, setInfoJob] = useState(null);
+  const [manualSearchJob, setManualSearchJob] = useState(null);
   const [actionStates, setActionStates] = useState({});
   const [filterValue, setFilterValue] = useState("");
   const [searchingAll, setSearchingAll] = useState(false);
@@ -440,6 +461,7 @@ export default function ActivityMissingPage() {
               actionState={actionStates[getMissingJobKey(job)] || (job.upgradeQueued ? "queued" : "")}
               onAction={handleAction}
               onInfo={setInfoJob}
+              onManualSearch={setManualSearchJob}
             />
           ))}
           {hasMoreJobs ? (
@@ -456,6 +478,17 @@ export default function ActivityMissingPage() {
         </div>
       ) : null}
       <ActivityInfoModal item={infoJob} onClose={() => setInfoJob(null)} />
+      <ManualMissingSearchModal
+        job={manualSearchJob}
+        onClose={() => setManualSearchJob(null)}
+        onQueued={(job) => {
+          const id = getMissingJobKey(job);
+          queryClient.setQueryData(jobsQueryKey, (current) =>
+            (Array.isArray(current) ? current : []).filter((entry) => getMissingJobKey(entry) !== id),
+          );
+          showSuccess(`Downloading ${job.trackName || "selected track"}`);
+        }}
+      />
     </section>
   );
 }

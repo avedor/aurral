@@ -1,5 +1,4 @@
 import { ChevronDown } from "lucide-react";
-import PillToggle from "../../../components/PillToggle";
 import {
   MixSlider,
   getFocusDraftValidation,
@@ -9,6 +8,7 @@ import {
   WEEKDAY_OPTIONS,
   SCHEDULE_HOUR_OPTIONS,
 } from "./MixSlider.jsx";
+import Tooltip from "../../../components/Tooltip";
 
 export function FlowScheduleFields({
   draft,
@@ -79,68 +79,45 @@ export function FlowScheduleFields({
             {WEEKDAY_OPTIONS.map((day) => {
               const checked = scheduleDays.includes(day.id);
               return (
-                <button
-                  key={day.id}
-                  type="button"
-                  className={`flow-page__weekday${checked ? " is-active" : ""}`}
-                  title={day.full}
-                  aria-label={day.full}
-                  aria-pressed={checked}
-                  disabled={checked && scheduleDays.length === 1}
-                  onClick={() =>
-                    updateDraft((prev) => {
-                      const current = Array.isArray(prev?.scheduleDays) ? prev.scheduleDays : [];
-                      const normalized = [
-                        ...new Set(
-                          current
-                            .map((entry) => Number(entry))
-                            .filter(
-                              (entry) => Number.isFinite(entry) && entry >= 0 && entry <= 6,
-                            ),
-                        ),
-                      ];
-                      if (checked && normalized.length === 1) {
-                        return prev;
-                      }
-                      const next = checked
-                        ? normalized.filter((entry) => entry !== day.id)
-                        : [...normalized, day.id];
-                      return {
-                        ...prev,
-                        scheduleDays: next.sort((a, b) => a - b),
-                      };
-                    })
-                  }
-                >
-                  <span>{day.short}</span>
-                </button>
+                <Tooltip key={day.id} content={day.full}>
+                  <button
+                    type="button"
+                    className={`flow-page__weekday${checked ? " is-active" : ""}`}
+                    aria-label={day.full}
+                    aria-pressed={checked}
+                    aria-disabled={checked && scheduleDays.length === 1}
+                    onClick={() => {
+                      if (checked && scheduleDays.length === 1) return;
+                      updateDraft((prev) => {
+                        const current = Array.isArray(prev?.scheduleDays) ? prev.scheduleDays : [];
+                        const normalized = [
+                          ...new Set(
+                            current
+                              .map((entry) => Number(entry))
+                              .filter(
+                                (entry) => Number.isFinite(entry) && entry >= 0 && entry <= 6,
+                              ),
+                          ),
+                        ];
+                        if (checked && normalized.length === 1) {
+                          return prev;
+                        }
+                        const next = checked
+                          ? normalized.filter((entry) => entry !== day.id)
+                          : [...normalized, day.id];
+                        return {
+                          ...prev,
+                          scheduleDays: next.sort((a, b) => a - b),
+                        };
+                      });
+                    }}
+                  >
+                    <span>{day.short}</span>
+                  </button>
+                </Tooltip>
               );
             })}
           </div>
-        </div>
-      </div>
-      <div className="flow-page__history-setting">
-        <div className="flow-page__history-copy">
-          <div className="flow-page__field-label">Record listening history</div>
-          <p className="flow-page__history-description">
-            When off, tracks from this flow will not affect future recommendations or connected
-            scrobblers.
-          </p>
-        </div>
-        <div className="flow-page__history-control">
-          <span className="flow-page__history-state" aria-hidden="true">
-            {draft?.recordHistory !== false ? "On" : "Off"}
-          </span>
-          <PillToggle
-            checked={draft?.recordHistory !== false}
-            aria-label={`Record listening history ${draft?.recordHistory !== false ? "on" : "off"}`}
-            onChange={(event) =>
-              updateDraft((prev) => ({
-                ...prev,
-                recordHistory: event.target.checked,
-              }))
-            }
-          />
         </div>
       </div>
     </div>
@@ -217,6 +194,7 @@ export function FlowFormFields({
   };
   const normalizedMix = normalizeMixPercent(draft?.mix);
   const totalSize = Math.max(0, Math.round(Number(draft?.size) || 0));
+  const isDeepDiveDisabled = Object.keys(disabledSources || {}).length > 0;
   const { focusEnabled, focusValidationError } = getFocusDraftValidation(
     draft,
     normalizeMixPercent,
@@ -267,29 +245,31 @@ export function FlowFormFields({
             trackCounts={mixScaled}
             disabledSources={disabledSources}
             trailingControl={
-              <button
-                type="button"
-                onClick={() =>
-                  updateDraft((prev) => ({
-                    ...prev,
-                    deepDive: !(prev?.deepDive === true),
-                  }))
-                }
-                className={`flow-page__mix-toggle flow-page__mix-toggle--feature${draft.deepDive === true ? " is-active" : ""}${Object.keys(disabledSources || {}).length > 0 ? " is-disabled" : ""}`}
-                aria-pressed={draft.deepDive === true}
-                disabled={Object.keys(disabledSources || {}).length > 0}
-                title={
-                  Object.keys(disabledSources || {}).length > 0
+              <Tooltip content={
+                  isDeepDiveDisabled
                     ? "Last.fm API key required. Deep Dive skips the most obvious tracks and pulls tracks ranked 10-25."
                     : "Deep Dive skips the most obvious tracks and pulls tracks ranked 10-25."
-                }
-                aria-label={`Deep Dive ${draft.deepDive === true ? "on" : "off"}. Deep Dive pulls tracks ranked 10 through 25 instead of the top 10.`}
-              >
-                <span>Deep Dive</span>
-                <span className="flow-page__mix-toggle-state">
-                  {draft.deepDive === true ? "On" : "Off"}
-                </span>
-              </button>
+                }>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (isDeepDiveDisabled) return;
+                    updateDraft((prev) => ({
+                      ...prev,
+                      deepDive: !(prev?.deepDive === true),
+                    }));
+                  }}
+                  className={`flow-page__mix-toggle flow-page__mix-toggle--feature${draft.deepDive === true ? " is-active" : ""}${isDeepDiveDisabled ? " is-disabled" : ""}`}
+                  aria-pressed={draft.deepDive === true}
+                  aria-disabled={isDeepDiveDisabled}
+                  aria-label={`Deep Dive ${draft.deepDive === true ? "on" : "off"}. Deep Dive pulls tracks ranked 10 through 25 instead of the top 10.`}
+                >
+                  <span>Deep Dive</span>
+                  <span className="flow-page__mix-toggle-state">
+                    {draft.deepDive === true ? "On" : "Off"}
+                  </span>
+                </button>
+              </Tooltip>
             }
             onChange={(nextMix) =>
               updateDraft((prev) => ({

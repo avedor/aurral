@@ -3,8 +3,10 @@ import { spotifyClient } from "../spotify/spotifyClient.js";
 import { parseSpotifyPlaylistItems } from "./spotifyTracks.js";
 import { listenbrainzPlaylistClient } from "./listenbrainzPlaylists.js";
 import { lastfmStationClient } from "./lastfmStations.js";
+import { youtubeMusicPlaylistClient } from "./youtubeMusicPlaylists.js";
 import { normalizeImportSource } from "../weeklyFlow/weeklyFlowPlaylistConfig.js";
 import { weeklyFlowOperationQueue } from "../weeklyFlow/weeklyFlowOperationQueue.js";
+import { logger } from "../logger.js";
 
 export async function fetchImportedPlaylistTracks({
   provider,
@@ -16,7 +18,7 @@ export async function fetchImportedPlaylistTracks({
   if (provider === "spotify-playlist") {
     const items = await spotifyClient.listPlaylistTracks(userId, externalId, { forceRefresh });
     const parsed = parseSpotifyPlaylistItems(items);
-    return { tracks: parsed.tracks, stats: parsed.stats };
+    return parsed;
   }
   if (provider === "listenbrainz-playlist") {
     return listenbrainzPlaylistClient.getPlaylistTracks(userId, externalId);
@@ -26,6 +28,13 @@ export async function fetchImportedPlaylistTracks({
   }
   if (provider === "lastfm-station") {
     return lastfmStationClient.getStationTracks(userId, externalId, externalUsername);
+  }
+  if (provider === "youtube-music-playlist") {
+    const { tracks, stats, excluded } = await youtubeMusicPlaylistClient.getPlaylist(
+      externalId,
+      { forceRefresh },
+    );
+    return { tracks, stats, excluded };
   }
   const error = new Error(`Unsupported playlist import provider: ${provider || "unknown"}`);
   error.statusCode = 400;
@@ -41,6 +50,7 @@ export async function enqueueImportedPlaylist({
   externalUsername,
   externalName,
   tracks,
+  sourceStats = null,
   syncEnabled,
   syncIntervalHours,
   keepRemovedTracks,
@@ -66,6 +76,14 @@ export async function enqueueImportedPlaylist({
     tracks,
     ownerUserId,
     importSource,
+  });
+  logger.info("playlist-import", "Playlist import queued", {
+    provider,
+    playlistName: name,
+    playlistId: safePlaylistId,
+    operationId: result.operationId,
+    trackCount: tracks.length,
+    ...(sourceStats ? { skipped: sourceStats } : {}),
   });
   return { ...result, tracksQueued: tracks.length };
 }

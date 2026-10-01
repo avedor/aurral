@@ -2,7 +2,7 @@ import { libraryManager } from "../../../services/libraryManager.js";
 import { playlistManager } from "../../../services/weeklyFlow/weeklyFlowPlaylistManager.js";
 import { dbOps } from "../../../db/helpers/index.js";
 import { hasPermission } from "../../../middleware/auth.js";
-import { cacheMiddleware } from "../../../middleware/cache.js";
+import { cacheMiddleware, noCache } from "../../../middleware/cache.js";
 import {
   requireAuth,
   requirePermission,
@@ -141,6 +141,7 @@ export function registerAlbums(router) {
           albumName: album.albumName || albumName,
           artistName: album.artistName,
           artistMbid: album.mbid || album.foreignAlbumId,
+          managedBy,
           searching: managedBy === "lidarr" && searchOnAdd,
           user: req.user,
         });
@@ -197,6 +198,7 @@ export function registerAlbums(router) {
           albumName: result?.album?.albumName || result?.albumName || albumName,
           artistName: result?.artist?.artistName || result?.artistName || artistName,
           artistMbid: result?.artist?.mbid || result?.mbid || artistMbid,
+          managedBy: result?.managedBy || null,
           user: req.user,
         };
         recordAlbumRequested({
@@ -226,6 +228,91 @@ export function registerAlbums(router) {
           providerId: error.providerId || null,
           availability: error.availability || null,
           conflict: error.conflict || null,
+        });
+      }
+    },
+  );
+
+  router.get("/albums/aurral/:canonicalId/status", noCache, (req, res) => {
+    try {
+      const result = libraryManager.getAurralAlbumStatus(req.params.canonicalId);
+      if (result?.error) {
+        const { error, statusCode, ...details } = result;
+        return res.status(statusCode || 500).json({ ...details, error });
+      }
+      return res.json(result);
+    } catch (error) {
+      return res.status(500).json({
+        error: "Failed to fetch album status",
+        message: error.message,
+      });
+    }
+  });
+
+  router.put(
+    "/albums/aurral/:canonicalId",
+    requireAuth,
+    requirePermission("changeMonitoring"),
+    async (req, res) => {
+      try {
+        const result = await libraryManager.setAurralAlbumMonitoring(
+          req.params.canonicalId,
+          { monitored: req.body?.monitored },
+        );
+        if (result?.error) {
+          const { error, statusCode, ...details } = result;
+          return res.status(statusCode || 500).json({ ...details, error });
+        }
+        return res.json(result);
+      } catch (error) {
+        return res.status(500).json({
+          error: "Failed to update album monitoring",
+          message: error.message,
+        });
+      }
+    },
+  );
+
+  router.delete(
+    "/albums/aurral/:canonicalId",
+    requireAuth,
+    requirePermission("deleteAlbum"),
+    async (req, res) => {
+      try {
+        const result = await libraryManager.deleteAurralAlbum(
+          req.params.canonicalId,
+          req.query?.deleteFiles === "true",
+        );
+        if (result?.error) {
+          const { error, statusCode, ...details } = result;
+          return res.status(statusCode || 500).json({ ...details, error });
+        }
+        return res.json(result);
+      } catch (error) {
+        return res.status(500).json({
+          error: "Failed to remove album",
+          message: error.message,
+        });
+      }
+    },
+  );
+
+  router.post(
+    "/albums/aurral/:canonicalId/cancel",
+    requireAuth,
+    requirePermission("addAlbum"),
+    async (req, res) => {
+      try {
+        const result = await libraryManager.cancelAurralAlbum(req.params.canonicalId);
+        if (result?.error) {
+          const { error, statusCode, ...details } = result;
+          return res.status(statusCode || 500).json({ ...details, error });
+        }
+        return res.json(result);
+      } catch (error) {
+        return res.status(500).json({
+          error: "Failed to cancel album",
+          message: error.message,
         });
       }
     },

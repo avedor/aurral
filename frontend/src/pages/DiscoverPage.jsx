@@ -40,6 +40,7 @@ import {
 import { useDiscoverData } from "./useDiscoverData";
 import { useLibraryNews } from "../hooks/useLibraryNews";
 import { formatDate } from "../utils/dateTime.js";
+import TooltipButton from "../components/TooltipButton";
 const getArtistId = (artist) => getArtistRecordId(artist);
 
 function DiscoverPage() {
@@ -79,6 +80,7 @@ function DiscoverPage() {
     canAddAlbum,
     getLibraryArtistImage,
     getRecentReleaseKey,
+    libraryDestination,
     handleAddArtistToLibrary,
     handleRecentReleaseAlbumAction,
     handleDiscoveryFeedback,
@@ -386,11 +388,15 @@ function DiscoverPage() {
 
   const handleOpenArtistInLibrary = useCallback(
     async (artist) => {
+      if (artist.canonicalId) {
+        navigate(`/library/artist/${encodeURIComponent(artist.canonicalId)}`);
+        return true;
+      }
       const artistId = getArtistId(artist);
       if (!artistId) return;
       try {
         const lookup = await lookupArtistInLibrary(artistId);
-        const canonicalId = lookup?.artist?.canonicalId;
+        const canonicalId = lookup?.libraryArtistId;
         if (!canonicalId) throw new Error("Library artist was not found");
         navigate(`/library/artist/${encodeURIComponent(canonicalId)}`);
         return true;
@@ -524,12 +530,14 @@ function DiscoverPage() {
                 <div key={`artist-${artist.id}`} className="artist-discover-shelf-card">
                   <ArtistCard
                     status="available"
-                    isInLibrary={!!libraryLookup[artistId]}
+                    isInLibrary={true}
                     canAddArtist={false}
                     onNavigate={navigate}
                     onOpenInLibrary={handleOpenArtistInLibrary}
                     artist={{
                       id: artistId,
+                      canonicalId: artist.canonicalId || artist.id,
+                      libraryPath: artistId ? null : `/library/artist/${encodeURIComponent(artist.canonicalId || artist.id)}`,
                       name: artist.artistName,
                       image: getLibraryArtistImage(artist),
                       type: "Artist",
@@ -579,6 +587,7 @@ function DiscoverPage() {
                   canAddAlbum={canAddAlbum}
                   isPending={!!pendingRecentReleaseIds[getRecentReleaseKey(album)]}
                   onAlbumAction={handleRecentReleaseAlbumAction}
+                  libraryDestination={libraryDestination}
                 />
               </div>
             ))}
@@ -1042,7 +1051,7 @@ function DiscoverPage() {
               )}
             </div>
 
-            <button
+            <TooltipButton
               type="button"
               onClick={openDiscoverModal}
               className="btn btn-icon-square btn-surface discover-page__customize-btn"
@@ -1050,7 +1059,7 @@ function DiscoverPage() {
               title="Customize Discover"
             >
               <LayoutTemplate className="artist-discover-hero__customize-icon" />
-            </button>
+            </TooltipButton>
           </div>
 
           <div className="artist-discover-hero__tags-section">

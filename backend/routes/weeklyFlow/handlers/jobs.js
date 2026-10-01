@@ -12,6 +12,8 @@ import { noCache } from "../../../middleware/cache.js";
 import { requireAdmin } from "../../../middleware/requirePermission.js";
 import {
   EXISTING_FILE_MODE_OPTIONS,
+  LIBRARY_JOB_TYPE,
+  canAccessJobType,
   canAccessPlaylistType,
   filterJobsForUser,
   pauseSharedPlaylistRetryCycle,
@@ -27,6 +29,10 @@ import {
   sanitizePathPart,
 } from "../../../services/playlistDownloadUtils.js";
 import { finalizePipelineJobSuccess } from "../../../services/pipelineHelpers.js";
+import {
+  getActiveDownloadAttemptId,
+  withPipelineCommitLock,
+} from "../../../services/weeklyFlow/weeklyFlowDownloadCancellation.js";
 import path from "path";
 import fs from "fs/promises";
 import { invalidateRequestsCache } from "../../requests.js";
@@ -34,9 +40,23 @@ import {
   decorateJobQuality,
   classifyQualityJob,
   getQualityProfile,
+  isAurralOwnedPath,
   queueQualityUpgrade,
   runQualityUpgradeCheck,
 } from "../../../services/qualityProfileService.js";
+import { getCanonicalTrackOwnershipBatch } from "../../../services/libraryQueryService.js";
+import { logger, safeLogDiagnostic } from "../../../services/logger.js";
+import { clearAllDownloadJobs } from "../../../services/weeklyFlow/weeklyFlowDownloadCancellationService.js";
+import {
+  isFlowOwnerProcess,
+  requestFlowOwner,
+} from "../../../services/weeklyFlow/weeklyFlowOwnerClient.js";
+import {
+  createManualMissingSearch,
+  consumeManualMissingSelection,
+  getManualMissingSelection,
+  getManualDownloadSources,
+} from "../../../services/manualMissingSearchService.js";
 
 const getAccessiblePlaylistIds = (user) => [
   ...new Set([
@@ -44,6 +64,55 @@ const getAccessiblePlaylistIds = (user) => [
     ...flowPlaylistConfig.getSharedPlaylistsForUser(user),
   ].map((playlist) => playlist.id)),
 ];
+
+const getActorId = (user) => String(user?.id || user?.username || "").trim();
+
+function getManualSearchMode(value) {
+  return String(value || "").trim() === "replacement" ? "replacement" : "missing";
+}
+
+function canAccessJobThroughPlaylist(user, job, playlistId) {
+  const safePlaylistId = String(playlistId || "").trim();
+  if (!safePlaylistId) return filterJobsForUser(user, [job]).length > 0;
+  if (!canAccessJobType(user, safePlaylistId)) return false;
+  if (job.playlistType === safePlaylistId || job.playlistId === safePlaylistId) return true;
+  const sharedPlaylist = flowPlaylistConfig.getSharedPlaylist(safePlaylistId);
+  return sharedPlaylist?.tracks?.some(
+    (track) => String(track?.canonicalJobId || "") === String(job.id || ""),
+  ) === true;
+}
+
+function getAccessibleManualSearchJob(user, jobId, { mode = "missing", playlistId = null } = {}) {
+  const job = downloadTracker.getJob(jobId);
+  if (!job || !canAccessJobThroughPlaylist(user, job, playlistId)) return null;
+  if (mode === "replacement") {
+    if (
+      job.status !== "done" ||
+      job.upgradeForJobId ||
+      job.managedBy !== "aurral" ||
+      !isAurralOwnedPath(job.finalPath) ||
+      downloadTracker.findActiveUpgradeJob(job)
+    ) {
+      return null;
+    }
+    return job;
+  }
+  if (job.status !== "failed" || job.upgradeForJobId) return null;
+  return job;
+}
+
+function toPublicJob({ stagingPath: _stagingPath, finalPath, externalPath: _externalPath, ...job }) {
+  const streamFormat = finalPath ? path.extname(finalPath).slice(1).toLowerCase() : "";
+  return { ...job, streamFormat: streamFormat || null };
+}
+
+async function runQualityChecksLocally(playlistIds) {
+  let queued = 0;
+  for (const playlistId of playlistIds) {
+    queued += await runQualityUpgradeCheck({ force: true, playlistId, limit: 500 });
+  }
+  return queued;
+}
 
 export function registerJobs(router) {
   router.get("/status", noCache, (req, res) => {
@@ -87,7 +156,16 @@ export function registerJobs(router) {
       );
     }
     const profile = getQualityProfile();
-    res.json(filterJobsForUser(req.user, jobs).map((job) => decorateJobQuality(job, profile)));
+    const accessibleJobs = filterJobsForUser(req.user, jobs).map((job) =>
+      decorateJobQuality(job, profile),
+    );
+    const libraryOwnership = getCanonicalTrackOwnershipBatch(accessibleJobs);
+    res.json(
+      accessibleJobs.map((job, index) => ({
+        ...toPublicJob(job),
+        libraryOwned: libraryOwnership[index] === true,
+      })),
+    );
   });
 
   router.get("/jobs", noCache, (req, res) => {
@@ -97,13 +175,96 @@ export function registerJobs(router) {
       status ? downloadTracker.getByStatus(status) : downloadTracker.getAll(),
     );
     const profile = getQualityProfile();
-    res.json(jobs.map((job) => decorateJobQuality(job, profile)));
+    res.json(jobs.map((job) => toPublicJob(decorateJobQuality(job, profile))));
+  });
+
+  router.get("/jobs/:jobId/files", requireAdmin, noCache, (req, res) => {
+    const job = downloadTracker.getJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: "Track not found" });
+    res.json({ paths: [job.finalPath].filter(Boolean) });
+  });
+
+  router.get("/jobs/:jobId/manual-search/sources", noCache, (req, res) => {
+    const mode = getManualSearchMode(req.query?.mode);
+    const playlistId = req.query?.playlistId;
+    const job = getAccessibleManualSearchJob(req.user, req.params.jobId, { mode, playlistId });
+    if (!job) return res.status(404).json({ error: "Track is not available for manual search" });
+    return res.json({ sources: getManualDownloadSources() });
+  });
+
+  router.post("/jobs/:jobId/manual-search", async (req, res) => {
+    const mode = getManualSearchMode(req.body?.mode);
+    const playlistId = req.body?.playlistId;
+    const job = getAccessibleManualSearchJob(req.user, req.params.jobId, { mode, playlistId });
+    if (!job) return res.status(404).json({ error: "Track is not available for manual search" });
+    try {
+      const result = await createManualMissingSearch({
+        job,
+        sourceId: req.body?.sourceId,
+        actorId: getActorId(req.user),
+        mode,
+        playlistId,
+      });
+      return res.json(result);
+    } catch (error) {
+      logger.warn("manual-search", "Manual track search failed", {
+        jobId: job.id,
+        sourceId: String(req.body?.sourceId || ""),
+        reason: safeLogDiagnostic(error),
+      });
+      return res.status(502).json({
+        error: "Manual search failed",
+        message: safeLogDiagnostic(error) || "The selected download client could not be searched",
+      });
+    }
+  });
+
+  router.post("/jobs/:jobId/manual-search/select", async (req, res) => {
+    try {
+      const selection = getManualMissingSelection({
+        sessionId: req.body?.sessionId,
+        resultId: req.body?.resultId,
+        jobId: req.params.jobId,
+        actorId: getActorId(req.user),
+      });
+      const job = getAccessibleManualSearchJob(req.user, req.params.jobId, {
+        mode: selection.mode,
+        playlistId: selection.playlistId,
+      });
+      if (!job) {
+        return res.status(409).json({ error: "Track is no longer available for manual search" });
+      }
+      const replacement = selection.mode === "replacement";
+      const queued = isFlowOwnerProcess()
+        ? replacement
+          ? downloadTracker.enqueueManualReplacementSelection(job.id, selection)
+          : downloadTracker.enqueueManualSelection(job.id, selection)
+        : await requestFlowOwner(
+          replacement ? "enqueueManualReplacementSelection" : "enqueueManualMissingSelection",
+          [job.id, selection], {
+            timeoutMs: 30_000,
+          },
+        );
+      if (!queued) {
+        return res.status(409).json({
+          error: "Track is no longer available for manual search",
+        });
+      }
+      consumeManualMissingSelection(req.body?.sessionId);
+      invalidateRequestsCache();
+      return res.json({ success: true, jobId: job.id });
+    } catch (error) {
+      return res.status(409).json({
+        error: "Could not queue selected result",
+        message: safeLogDiagnostic(error) || "The selected result could not be queued",
+      });
+    }
   });
 
   router.post("/research-missing", async (req, res) => {
     try {
       let requeued = 0;
-      for (const playlistId of getAccessiblePlaylistIds(req.user)) {
+      for (const playlistId of [LIBRARY_JOB_TYPE, ...getAccessiblePlaylistIds(req.user)]) {
         requeued += await weeklyFlowWorker.researchMissingTracks(playlistId);
       }
       return res.json({ success: true, requeued });
@@ -117,10 +278,12 @@ export function registerJobs(router) {
 
   router.post("/quality-upgrades", async (req, res) => {
     const playlistIds = getAccessiblePlaylistIds(req.user);
-    let queued = 0;
-    for (const playlistId of playlistIds) {
-      queued += await runQualityUpgradeCheck({ force: true, playlistId, limit: 500 });
-    }
+    const checkedIds = [LIBRARY_JOB_TYPE, ...playlistIds];
+    const queued = isFlowOwnerProcess()
+      ? await runQualityChecksLocally(checkedIds)
+      : await requestFlowOwner("runQualityUpgradeChecks", [checkedIds, 500], {
+        timeoutMs: 30 * 60 * 1000,
+      });
     if (queued > 0) invalidateRequestsCache();
     return res.json({
       success: true,
@@ -131,14 +294,18 @@ export function registerJobs(router) {
 
   router.post("/quality-upgrades/:playlistId/:jobId", async (req, res) => {
     const { playlistId, jobId } = req.params;
-    if (!canAccessPlaylistType(req.user, playlistId)) {
+    if (!canAccessJobType(req.user, playlistId)) {
       return res.status(404).json({ error: "Playlist not found" });
     }
     const job = downloadTracker.getJob(jobId);
     if (!job || job.playlistType !== playlistId) {
       return res.status(404).json({ error: "Track not found" });
     }
-    const result = await queueQualityUpgrade(job);
+    const result = isFlowOwnerProcess()
+      ? await queueQualityUpgrade(job)
+      : await requestFlowOwner("queueQualityUpgradeForJob", [job.id], {
+        timeoutMs: 10 * 60 * 1000,
+      });
     if (result === "already-queued") {
       return res.json({ success: true, queued: 0, alreadyQueued: true, jobId });
     }
@@ -147,16 +314,6 @@ export function registerJobs(router) {
     }
     invalidateRequestsCache();
     return res.json({ success: true, queued: 1, jobId });
-  });
-
-  router.post("/quality-upgrades/:playlistId", async (req, res) => {
-    const { playlistId } = req.params;
-    if (!canAccessPlaylistType(req.user, playlistId)) {
-      return res.status(404).json({ error: "Playlist not found" });
-    }
-    const queued = await runQualityUpgradeCheck({ force: true, playlistId, limit: 500 });
-    if (queued > 0) invalidateRequestsCache();
-    return res.json({ success: true, queued });
   });
 
   router.put("/playlists/:playlistId/retry-cycle", async (req, res) => {
@@ -177,7 +334,7 @@ export function registerJobs(router) {
       if (paused) {
         await pauseSharedPlaylistRetryCycle(playlistId);
       } else {
-        weeklyFlowWorker.setRetryCyclePaused(playlistId, false);
+        await weeklyFlowWorker.setRetryCyclePaused(playlistId, false);
         await weeklyFlowWorker.retryIncompletePlaylist(playlistId);
       }
       return res.json({
@@ -215,7 +372,7 @@ export function registerJobs(router) {
         });
       }
     }
-    const settings = weeklyFlowWorker.updateWorkerSettings({
+    const settings = await weeklyFlowWorker.updateWorkerSettings({
       concurrency,
       existingFileMode,
     });
@@ -257,6 +414,7 @@ export function registerJobs(router) {
     if (!job || job.status !== "blocked") {
       return res.status(404).json({ error: "Blocked job not found" });
     }
+    const downloadAttemptId = getActiveDownloadAttemptId(job.id);
     const sourcePath = String(job.stagingPath || "").trim();
     if (!sourcePath) {
       return res.status(400).json({ error: "Staging file path missing" });
@@ -278,16 +436,30 @@ export function registerJobs(router) {
     const finalName = `${sanitizePathPart(job.trackName, "Unknown Track")}${ext || ".mp3"}`;
     const finalPath = path.join(finalDir, finalName);
     try {
-      const committedPath = await commitImportToPlaylistLibrary(sourcePath, finalPath);
-      await finalizePipelineJobSuccess({
-        downloadTracker,
-        job,
-        committedFinalPath: committedPath,
-        album: job.albumName,
-      });
+      const committed = await withPipelineCommitLock(
+        {
+          jobId: job.id,
+          playlistId,
+          playlistGeneration: job.playlistGeneration,
+          downloadAttemptId,
+        },
+        async () => {
+          const committedPath = await commitImportToPlaylistLibrary(sourcePath, finalPath);
+          await finalizePipelineJobSuccess({
+            downloadTracker,
+            job,
+            committedFinalPath: committedPath,
+            album: job.albumName,
+          });
+          return committedPath;
+        },
+      );
+      if (committed.cancelled) {
+        return res.status(409).json({ error: "Download job was removed" });
+      }
       await classifyQualityJob(downloadTracker.getJob(job.id));
       invalidateRequestsCache();
-      res.json({ success: true, path: committedPath });
+      res.json({ success: true, path: committed.result });
     } catch (error) {
       res.status(500).json({ error: "Import failed", message: error.message });
     }
@@ -319,9 +491,18 @@ export function registerJobs(router) {
     res.json({ success: true });
   });
 
-  router.delete("/jobs/all", requireAdmin, (req, res) => {
-    const count = downloadTracker.clearAll();
-    res.json({ success: true, cleared: count });
+  router.delete("/jobs/all", requireAdmin, async (req, res) => {
+    try {
+      const count = await clearAllDownloadJobs(downloadTracker);
+      return res.json({ success: true, cleared: count });
+    } catch (error) {
+      logger.error("weekly-flow", "Could not safely clear download jobs", {
+        reason: error?.message || String(error),
+      });
+      return res.status(500).json({
+        error: "Some provider work could not be cancelled. Affected jobs were stopped in Aurral and marked failed. Retry clearing jobs after fixing the provider connection.",
+      });
+    }
   });
 
   router.post("/reset", requireAdmin, async (req, res) => {

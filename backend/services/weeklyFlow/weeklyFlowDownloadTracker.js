@@ -1,7 +1,11 @@
 import { randomUUID } from "crypto";
+import path from "node:path";
 import { db } from "../../config/db-sqlite.js";
-import { enqueuePipelineJob } from "../honkerDb.js";
-import { isAnyDownloadSourceConfigured } from "../downloadSourceService.js";
+import { enqueuePipelineJob, listHonkerJobs } from "../honkerDb.js";
+import {
+  isAlbumGrabSourceConfigured,
+  isAnyDownloadSourceConfigured,
+} from "../downloadSourceService.js";
 import {
   normalizePositiveInteger,
   normalizeStringList,
@@ -13,6 +17,17 @@ import {
   buildAurralTrackDestination,
 } from "../playlistPaths.js";
 import { flowPlaylistConfig } from "./weeklyFlowPlaylistConfig.js";
+import { logger } from "../logger.js";
+import { recordAlbumGrabQueued, recordAlbumTrackState } from "../albumGrabActivity.js";
+import {
+  cancelDownloadJob,
+  beginDownloadAttempt,
+  setActiveDownloadAttemptId,
+  cancelDownloadJobs,
+  getPlaylistDownloadGeneration,
+  isDownloadJobCancelled,
+  isPipelinePayloadActive,
+} from "./weeklyFlowDownloadCancellation.js";
 
 const parseDeniedSources = (raw) => {
   if (!raw) return [];
@@ -25,6 +40,44 @@ const parseDeniedSources = (raw) => {
 };
 
 const JOBS_TABLE = "playlist_download_jobs";
+const dataVersionStmt = db.prepare("PRAGMA data_version");
+const persistedRevisionStmt = db.prepare(
+  "SELECT revision FROM playlist_download_jobs_revision WHERE id = 1",
+);
+const liveJobStmt = db.prepare(`SELECT * FROM ${JOBS_TABLE} WHERE id = ?`);
+const livePlaylistJobsStmt = db.prepare(
+  `SELECT * FROM ${JOBS_TABLE} WHERE playlist_type = ? ORDER BY created_at, id`,
+);
+const livePlaylistIdJobsStmt = db.prepare(
+  `SELECT * FROM ${JOBS_TABLE}
+   WHERE playlist_id = ? OR playlist_type = ?
+   ORDER BY created_at, id`,
+);
+const livePlaylistJobsLimitedStmt = db.prepare(
+  `SELECT * FROM ${JOBS_TABLE} WHERE playlist_type = ? ORDER BY created_at, id LIMIT ?`,
+);
+const liveStatusJobsStmt = db.prepare(
+  `SELECT * FROM ${JOBS_TABLE} WHERE status = ? ORDER BY created_at, id`,
+);
+const liveStatsStmt = db.prepare(
+  `SELECT playlist_type, status, COUNT(*) AS count FROM ${JOBS_TABLE} GROUP BY playlist_type, status`,
+);
+const liveNextPendingStmt = db.prepare(
+  `SELECT * FROM ${JOBS_TABLE} WHERE status = 'pending' AND upgrade_for_job_id IS NULL
+   ORDER BY created_at, id LIMIT 1`,
+);
+const liveDoneWithPathStmt = db.prepare(
+  `SELECT * FROM ${JOBS_TABLE} WHERE status = 'done' AND final_path IS NOT NULL
+   ORDER BY created_at, id LIMIT ?`,
+);
+const livePendingStmt = db.prepare(
+  `SELECT * FROM ${JOBS_TABLE} WHERE status = 'pending' AND upgrade_for_job_id IS NULL
+   ORDER BY created_at, id LIMIT ?`,
+);
+const liveActivePlaylistStmt = db.prepare(
+  `SELECT 1 FROM ${JOBS_TABLE} WHERE playlist_type = ?
+   AND status IN ('pending', 'downloading') LIMIT 1`,
+);
 
 function rowToJob(row) {
   return {
@@ -46,9 +99,11 @@ function rowToJob(row) {
     albumTrackTitles: parseStringListJson(row.album_track_titles),
     artistAliases: parseStringListJson(row.artist_aliases),
     playlistId: row.playlist_id || row.playlist_type,
+    playlistGeneration: Number(row.playlist_generation ?? 0),
     playlistType: row.playlist_type || row.playlist_id,
     managedBy: row.managed_by === "lidarr" ? "lidarr" : "aurral",
     requestGroupId: row.request_group_id || null,
+    albumGrabAttempted: row.album_grab_attempted === 1,
     status: row.status,
     startedAt: row.started_at,
     completedAt: row.completed_at,
@@ -77,6 +132,7 @@ function rowToJob(row) {
     qualityCheckedAt: row.quality_checked_at ?? null,
     qualityUpgradeCheckedAt: row.quality_upgrade_checked_at ?? null,
     upgradeForJobId: row.upgrade_for_job_id || null,
+    manualReplacementSearch: row.manual_replacement_search === 1,
     retryCycle: false,
   };
 }
@@ -98,6 +154,7 @@ const insertStmt = db.prepare(`
     album_track_titles,
     artist_aliases,
     playlist_id,
+    playlist_generation,
     playlist_type,
     managed_by,
     request_group_id,
@@ -116,9 +173,10 @@ const insertStmt = db.prepare(`
     quality_bit_depth,
     quality_checked_at,
     quality_upgrade_checked_at,
-    upgrade_for_job_id
+    upgrade_for_job_id,
+    manual_replacement_search
   )
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateStmt = db.prepare(`
@@ -148,18 +206,19 @@ const updateStmt = db.prepare(`
       quality_bit_depth = ?,
       quality_checked_at = ?,
       quality_upgrade_checked_at = ?,
-      upgrade_for_job_id = ?
+      upgrade_for_job_id = ?,
+      manual_replacement_search = ?
   WHERE id = ?
 `);
 
 const deleteStmt = db.prepare(`DELETE FROM ${JOBS_TABLE} WHERE id = ?`);
+const updateAlbumGrabAttemptedStmt = db.prepare(
+  `UPDATE ${JOBS_TABLE} SET album_grab_attempted = ? WHERE id = ?`,
+);
 const deleteAllStmt = db.prepare(`DELETE FROM ${JOBS_TABLE}`);
 const selectAllStmt = db.prepare(`SELECT * FROM ${JOBS_TABLE} ORDER BY created_at ASC, id ASC`);
 const updatePlaylistTypeStmt = db.prepare(
   `UPDATE ${JOBS_TABLE} SET playlist_type = ?, playlist_id = ? WHERE playlist_type = ?`,
-);
-const updatePlaylistIdStmt = db.prepare(
-  `UPDATE ${JOBS_TABLE} SET playlist_id = ? WHERE id = ?`,
 );
 const clearSlskdMetaStmt = db.prepare(`
   UPDATE ${JOBS_TABLE}
@@ -216,11 +275,15 @@ function buildPipelinePayload(job) {
   const playlistId = job.playlistId || job.playlistType;
   const artistDir = sanitizePathPart(job.artistName, "Unknown Artist");
   const albumDir = sanitizePathPart(job.albumName, "Unknown Album");
-  const ephemeral = Boolean(flowPlaylistConfig.getFlow(String(job.playlistType || "").trim()));
+  const ephemeral = Boolean(
+    flowPlaylistConfig.getFlow(String(job.playlistId || job.playlistType || "").trim()),
+  );
   return {
     phase: "search",
+    downloadAttemptId: beginDownloadAttempt(job.id),
     jobId: job.id,
     playlistId,
+    playlistGeneration: job.playlistGeneration,
     track: {
       artistName: job.artistName,
       trackName: job.trackName,
@@ -237,14 +300,19 @@ function buildPipelinePayload(job) {
     },
     attempt: 0,
     destination: buildAurralTrackDestination(playlistId, artistDir, albumDir, { ephemeral }),
-    upgrade: Boolean(job.upgradeForJobId),
+    upgrade: Boolean(job.upgradeForJobId) && !job.manualReplacementSearch,
     upgradeForJobId: job.upgradeForJobId || null,
-    allowedSources: job.upgradeForJobId ? ["slskd", "usenet", "deemix"] : null,
+    manualReplacementSearch: job.manualReplacementSearch === true,
+    allowedSources:
+      job.upgradeForJobId && !job.manualReplacementSearch
+        ? ["slskd", "usenet", "deemix"]
+        : null,
   };
 }
 
 export class WeeklyFlowDownloadTracker {
-  constructor() {
+  constructor({ enqueuePipeline = enqueuePipelineJob } = {}) {
+    this.enqueuePipeline = enqueuePipeline;
     this.jobs = new Map();
     this.statsByPlaylistType = new Map();
     this.globalStats = this._emptyStats();
@@ -255,6 +323,52 @@ export class WeeklyFlowDownloadTracker {
     this.slskdDispatched = new Set();
     this.revision = 0;
     this._load();
+    this.externalDataVersion = dataVersionStmt.get()?.data_version;
+    this.externalJobsRevision = persistedRevisionStmt.get()?.revision;
+  }
+
+  _refreshExternalChanges() {
+    if (this.externalDataVersion === undefined) return;
+    if (process.env.NODE_ENV === "test" || process.env.AURRAL_TEST_SERVER === "1") return;
+    const version = dataVersionStmt.get()?.data_version;
+    if (version === this.externalDataVersion) return;
+    this.externalDataVersion = version;
+    const jobsRevision = persistedRevisionStmt.get()?.revision;
+    if (jobsRevision === this.externalJobsRevision) return;
+    this.externalJobsRevision = jobsRevision;
+    this.reconcileCommittedJobs();
+  }
+
+  reconcileCommittedJobs(redirects = []) {
+    const previousJobs = this.jobs;
+    const previousRetryIds = this.pendingRetrySet;
+    const nextJobs = new Map();
+    for (const row of selectAllStmt.all()) {
+      const fresh = rowToJob(row);
+      const previous = previousJobs.get(fresh.id);
+      fresh.retryCycle = previous?.retryCycle === true || previousRetryIds.has(fresh.id);
+      if (previous) Object.assign(previous, fresh);
+      nextJobs.set(fresh.id, previous || fresh);
+    }
+    this.jobs = nextJobs;
+    this.slskdDispatched = new Set(
+      [...this.slskdDispatched].filter((id) => nextJobs.has(id)),
+    );
+    for (const { fromJobId, toJobId, dispatched } of redirects) {
+      this.slskdDispatched.delete(fromJobId);
+      if (dispatched && nextJobs.has(toJobId)) this.slskdDispatched.add(toJobId);
+    }
+    this._rebuildStatsByPlaylistType();
+    for (const id of previousRetryIds) {
+      const job = nextJobs.get(id);
+      if (!job || job.status !== "pending") continue;
+      this.pendingRetrySet.add(id);
+      this.pendingFreshQueue = this.pendingFreshQueue.filter((entry) => entry !== id);
+      this.pendingRetryQueue.push(id);
+    }
+    this._touchRevision();
+    this.externalDataVersion = dataVersionStmt.get()?.data_version;
+    this.externalJobsRevision = persistedRevisionStmt.get()?.revision;
   }
 
   _touchRevision() {
@@ -264,6 +378,14 @@ export class WeeklyFlowDownloadTracker {
   isSlskdDispatched(id) {
     const job = this.jobs.get(id);
     return this.slskdDispatched.has(id) || !!job?.slskdBatchId || !!job?.slskdSearchId;
+  }
+
+  setAlbumGrabAttempted(id, attempted) {
+    const job = this.jobs.get(id);
+    if (!job) return false;
+    job.albumGrabAttempted = attempted === true;
+    updateAlbumGrabAttemptedStmt.run(job.albumGrabAttempted ? 1 : 0, id);
+    return true;
   }
 
   markSlskdDispatched(id) {
@@ -330,21 +452,133 @@ export class WeeklyFlowDownloadTracker {
       metadata.remoteFilename ?? null,
       id,
     );
+    recordAlbumTrackState(job);
     return true;
   }
 
   enqueueDownloadPipeline(jobId) {
     if (!isAnyDownloadSourceConfigured()) return false;
     const job = this.jobs.get(jobId);
-    if (!job || job.status !== "pending") return false;
-    if (this.isSlskdDispatched(jobId)) return false;
-    enqueuePipelineJob(buildPipelinePayload(job));
+    if (!job) return false;
+    const activeGrab = job.requestGroupId && job.albumGrabAttempted
+      ? listHonkerJobs("slskd-pipeline").find((entry) => entry.payload?.albumGrab === true
+        && entry.payload?.albumGroupJobIds?.includes(jobId))
+      : null;
+    if (activeGrab && ["pending", "downloading"].includes(job.status)) {
+      recordAlbumGrabQueued(activeGrab.payload, activeGrab.payload.albumGroupJobIds.map((id) => this.jobs.get(id)).filter(Boolean));
+      for (const siblingId of activeGrab.payload.albumGroupJobIds) {
+        if (this.jobs.get(siblingId)?.status === "pending") {
+          this.setDownloading(siblingId);
+        }
+      }
+      if (jobId === activeGrab.payload.jobId) this.markSlskdDispatched(jobId);
+      return true;
+    }
+    if (job.status !== "pending" || this.isSlskdDispatched(jobId)) return false;
+    const payload = buildPipelinePayload(job);
+    if (!isPipelinePayloadActive(payload)) return false;
+    const siblings = job.managedBy === "aurral" && job.playlistType === "library"
+      && job.requestGroupId && !job.upgradeForJobId && !job.manualReplacementSearch
+      && !job.albumGrabAttempted && isAlbumGrabSourceConfigured()
+      ? this.getAll().filter((entry) => entry.requestGroupId === job.requestGroupId
+        && entry.albumMbid === job.albumMbid && entry.status === "pending"
+        && !entry.upgradeForJobId && !entry.manualReplacementSearch && !entry.albumGrabAttempted)
+      : [];
+    if (siblings.length > 1) {
+      payload.albumGrab = true;
+      payload.albumGroupJobIds = [jobId, ...siblings.filter((entry) => entry.id !== jobId)
+        .sort((left, right) => Number(left.trackNumber || 0) - Number(right.trackNumber || 0)
+          || String(left.id).localeCompare(String(right.id)))
+        .map((entry) => entry.id)];
+      for (const sibling of siblings) {
+        setActiveDownloadAttemptId(sibling.id, payload.downloadAttemptId);
+        this.setAlbumGrabAttempted(sibling.id, true);
+      }
+      for (const sibling of siblings) {
+        if (sibling.id !== jobId) this.setDownloading(sibling.id);
+      }
+    }
+    try {
+      this.enqueuePipeline(payload);
+    } catch (error) {
+      for (const siblingId of payload.albumGroupJobIds || []) {
+        if (siblingId !== jobId) this.setPending(siblingId);
+        this.setAlbumGrabAttempted(siblingId, false);
+      }
+      throw error;
+    }
     this.markSlskdDispatched(jobId);
+    if (payload.albumGrab === true) recordAlbumGrabQueued(payload, siblings);
     return true;
   }
 
   enqueueSlskdPipeline(jobId) {
     return this.enqueueDownloadPipeline(jobId);
+  }
+
+  enqueueManualSelection(jobId, { source, candidate, downloadClient = null } = {}) {
+    const job = this.jobs.get(jobId);
+    const normalizedSource = String(source || "").trim();
+    if (!job || job.status !== "failed" || job.upgradeForJobId) return false;
+    if (!candidate?.raw || !["slskd", "usenet", "deemix", "ytdlp"].includes(normalizedSource)) {
+      return false;
+    }
+    const payload = {
+      ...buildPipelinePayload(job),
+      phase: "download",
+      source: normalizedSource,
+      allowedSources: [normalizedSource],
+      candidates: [candidate],
+      candidateIndex: 0,
+      manualSelection: true,
+      manualDownloadClient: downloadClient || null,
+    };
+    if (!this.setPending(jobId, "Manual download queued", { asRetryCycle: false })) return false;
+    // Reserve the job before publishing it so automatic dispatch cannot claim it
+    // during the queue handoff.
+    this.markSlskdDispatched(jobId);
+    try {
+      this.enqueuePipeline(payload);
+      return true;
+    } catch {
+      // Preserve the manual workflow on failure: the result session remains
+      // available and the job cannot fall through to automatic selection.
+      this.setFailed(jobId, "Manual download could not be queued");
+      return false;
+    }
+  }
+
+  enqueueManualReplacementSelection(
+    jobId,
+    { source, candidate, downloadClient = null } = {},
+  ) {
+    const sourceJob = this.jobs.get(jobId);
+    const normalizedSource = String(source || "").trim();
+    if (!sourceJob || sourceJob.status !== "done" || !sourceJob.finalPath) return false;
+    if (!candidate?.raw || !["slskd", "usenet", "deemix", "ytdlp"].includes(normalizedSource)) {
+      return false;
+    }
+    const replacementJobId = this.addReplacementSearchJob(sourceJob);
+    if (!replacementJobId) return false;
+    const replacementJob = this.jobs.get(replacementJobId);
+    const payload = {
+      ...buildPipelinePayload(replacementJob),
+      phase: "download",
+      source: normalizedSource,
+      allowedSources: [normalizedSource],
+      candidates: [candidate],
+      candidateIndex: 0,
+      manualSelection: true,
+      manualDownloadClient: downloadClient || null,
+    };
+    this.markSlskdDispatched(replacementJobId);
+    try {
+      this.enqueuePipeline(payload);
+      return true;
+    } catch {
+      this.removeJob(replacementJobId);
+      return false;
+    }
   }
 
   _emptyStats() {
@@ -355,6 +589,8 @@ export class WeeklyFlowDownloadTracker {
       blocked: 0,
       done: 0,
       failed: 0,
+      cancel_requested: 0,
+      cancelled: 0,
     };
   }
 
@@ -366,6 +602,8 @@ export class WeeklyFlowDownloadTracker {
       blocked: Number(stats?.blocked || 0),
       done: Number(stats?.done || 0),
       failed: Number(stats?.failed || 0),
+      cancel_requested: Number(stats?.cancel_requested || 0),
+      cancelled: Number(stats?.cancelled || 0),
     };
   }
 
@@ -430,8 +668,16 @@ export class WeeklyFlowDownloadTracker {
     const rows = selectAllStmt.all();
     for (const row of rows) {
       const job = rowToJob(row);
-      if (job.status === "downloading") {
-        job.status = "pending";
+      if ((job.status === "downloading" || job.status === "cancel_requested") && (
+        process.env.AURRAL_BACKGROUND_WORKER_GROUP === "flow" ||
+        process.env.NODE_ENV === "test" || process.env.AURRAL_TEST_SERVER === "1"
+      )) {
+        if (this._isInterruptedCancellation(job)) {
+          job.status = "cancelled";
+          job.completedAt = Date.now();
+        } else {
+          job.status = "pending";
+        }
         job.startedAt = null;
         job.stagingPath = null;
         updateStmt.run(
@@ -461,13 +707,19 @@ export class WeeklyFlowDownloadTracker {
           job.qualityCheckedAt ?? null,
           job.qualityUpgradeCheckedAt ?? null,
           job.upgradeForJobId ?? null,
+          job.manualReplacementSearch ? 1 : 0,
           job.id,
         );
       }
       this.jobs.set(job.id, job);
     }
-    for (const job of this.jobs.values()) {
-      if (job.status === "pending" && job.upgradeForJobId) this.removeJob(job.id);
+    if (process.env.AURRAL_BACKGROUND_WORKER_GROUP === "flow" ||
+        process.env.NODE_ENV === "test" || process.env.AURRAL_TEST_SERVER === "1") {
+      for (const job of this.jobs.values()) {
+        if (job.status === "pending" && job.upgradeForJobId && !job.manualReplacementSearch) {
+          this.removeJob(job.id);
+        }
+      }
     }
     this._rebuildStatsByPlaylistType();
   }
@@ -491,6 +743,7 @@ export class WeeklyFlowDownloadTracker {
       stringifyStringListJson(job.albumTrackTitles),
       stringifyStringListJson(job.artistAliases),
       job.playlistId || job.playlistType,
+      job.playlistGeneration ?? 0,
       job.playlistType || job.playlistId,
       job.managedBy === "lidarr" ? "lidarr" : "aurral",
       job.requestGroupId ?? null,
@@ -510,6 +763,7 @@ export class WeeklyFlowDownloadTracker {
       job.qualityCheckedAt ?? null,
       job.qualityUpgradeCheckedAt ?? null,
       job.upgradeForJobId ?? null,
+      job.manualReplacementSearch ? 1 : 0,
     );
     this._touchRevision();
   }
@@ -542,18 +796,21 @@ export class WeeklyFlowDownloadTracker {
       job.qualityCheckedAt ?? null,
       job.qualityUpgradeCheckedAt ?? null,
       job.upgradeForJobId ?? null,
+      job.manualReplacementSearch ? 1 : 0,
       job.id,
     );
+    recordAlbumTrackState(job);
     this._touchRevision();
   }
 
-  addJob(track, playlistType) {
+  addJob(track, playlistType, options = {}) {
     const id = randomUUID();
     const artistName = String(track?.artistName || "").trim();
     const trackName = String(track?.trackName || "").trim();
     if (!artistName || !trackName) {
       return null;
     }
+    const playlistId = options?.playlistId || playlistType;
     const job = {
       id,
       artistName,
@@ -572,7 +829,10 @@ export class WeeklyFlowDownloadTracker {
       albumTrackCount: normalizePositiveInteger(track?.albumTrackCount),
       albumTrackTitles: normalizeStringList(track?.albumTrackTitles),
       artistAliases: normalizeStringList(track?.artistAliases),
-      playlistId: playlistType,
+      playlistId,
+      playlistGeneration: Number.isInteger(options?.playlistGeneration)
+        ? options.playlistGeneration
+        : getPlaylistDownloadGeneration(playlistId),
       playlistType,
       managedBy: track?.managedBy === "lidarr" ? "lidarr" : "aurral",
       requestGroupId: track?.requestGroupId
@@ -597,6 +857,29 @@ export class WeeklyFlowDownloadTracker {
     return id;
   }
 
+  ensureLibraryTrackJob(track, finalPath) {
+    const sourcePath = String(finalPath || "").trim();
+    if (!sourcePath) return null;
+    const resolvedPath = path.resolve(sourcePath);
+    const existing = [...this.jobs.values()].find(
+      (job) =>
+        job.status === "done" &&
+        job.managedBy === "aurral" &&
+        !job.upgradeForJobId &&
+        job.finalPath &&
+        path.resolve(job.finalPath) === resolvedPath,
+    );
+    if (existing) return existing;
+
+    const id = this.addJob(
+      { ...track, managedBy: "aurral", reason: track?.reason || "Aurral library track" },
+      "library",
+      { playlistId: "library" },
+    );
+    if (!id || !this.setDone(id, resolvedPath, track?.albumName)) return null;
+    return this.jobs.get(id) || null;
+  }
+
   addJobs(tracks, playlistType) {
     const ids = [];
     for (const track of tracks) {
@@ -612,7 +895,7 @@ export class WeeklyFlowDownloadTracker {
     return [...this.jobs.values()].find((job) => {
       if (
         !job.upgradeForJobId ||
-        (job.status !== "pending" && job.status !== "downloading")
+        !["pending", "downloading", "blocked"].includes(job.status)
       ) {
         return false;
       }
@@ -623,11 +906,31 @@ export class WeeklyFlowDownloadTracker {
   addUpgradeJob(sourceJob) {
     if (!sourceJob?.id || sourceJob.status !== "done" || !sourceJob.finalPath) return null;
     if (this.findActiveUpgradeJob(sourceJob)) return null;
-    const id = this.addJob(sourceJob, "quality-upgrade");
+    const playlistId = sourceJob.playlistId || sourceJob.playlistType;
+    const id = this.addJob(sourceJob, "quality-upgrade", {
+      playlistId,
+      playlistGeneration: sourceJob.playlistGeneration,
+    });
     const job = this.jobs.get(id);
-    job.playlistId = sourceJob.playlistId || sourceJob.playlistType;
     job.upgradeForJobId = sourceJob.id;
-    updatePlaylistIdStmt.run(job.playlistId, id);
+    this.pendingSet.delete(id);
+    this.pendingRetrySet.delete(id);
+    this._removeFromPendingQueues(id);
+    this._update(job);
+    return id;
+  }
+
+  addReplacementSearchJob(sourceJob) {
+    if (!sourceJob?.id || sourceJob.status !== "done" || !sourceJob.finalPath) return null;
+    if (this.findActiveUpgradeJob(sourceJob)) return null;
+    const playlistId = sourceJob.playlistId || sourceJob.playlistType;
+    const id = this.addJob(sourceJob, "quality-upgrade", {
+      playlistId,
+      playlistGeneration: getPlaylistDownloadGeneration(playlistId),
+    });
+    const job = this.jobs.get(id);
+    job.upgradeForJobId = sourceJob.id;
+    job.manualReplacementSearch = true;
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
     this._removeFromPendingQueues(id);
@@ -761,6 +1064,7 @@ export class WeeklyFlowDownloadTracker {
   removeJob(id) {
     const job = this.jobs.get(id);
     if (!job) return false;
+    cancelDownloadJob(id);
     this.clearSlskdPipelineState(id);
     this.jobs.delete(id);
     this.pendingSet.delete(id);
@@ -818,7 +1122,15 @@ export class WeeklyFlowDownloadTracker {
   getNextPendingMatching(predicate = null, lastPlaylistType = null) {
     const accepts = typeof predicate === "function" ? predicate : () => true;
     const canProcess = (job) =>
-      job && job.status === "pending" && !this._shouldSkipForWorker(job) && accepts(job);
+      job &&
+      job.status === "pending" &&
+      !this._shouldSkipForWorker(job) &&
+      isPipelinePayloadActive({
+        jobId: job.id,
+        playlistId: job.playlistId || job.playlistType,
+        playlistGeneration: job.playlistGeneration,
+      }) &&
+      accepts(job);
     this.pendingFreshQueue = this._compactPendingQueue(this.pendingFreshQueue);
     const nextFresh = this._pickPendingFromQueue(this.pendingFreshQueue, lastPlaylistType);
     if (canProcess(nextFresh)) return nextFresh;
@@ -861,7 +1173,7 @@ export class WeeklyFlowDownloadTracker {
 
   setDownloading(id, stagingPath = null) {
     const job = this.jobs.get(id);
-    if (!job) return false;
+    if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
     this.pendingSet.delete(id);
     this.pendingRetrySet.delete(id);
@@ -878,9 +1190,10 @@ export class WeeklyFlowDownloadTracker {
 
   setPending(id, error = null, options = {}) {
     const job = this.jobs.get(id);
-    if (!job) return false;
+    if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
     const asRetryCycle = options?.asRetryCycle === true;
+    if (asRetryCycle) this.setAlbumGrabAttempted(id, false);
     this.clearSlskdPipelineState(id);
     job.status = "pending";
     job.startedAt = null;
@@ -905,7 +1218,7 @@ export class WeeklyFlowDownloadTracker {
 
   deferPendingToBack(id, error = null, options = {}) {
     const job = this.jobs.get(id);
-    if (!job || job.status !== "pending") return false;
+    if (!job || job.status !== "pending" || this._isCancelledAlbumJob(job)) return false;
     const keepRetryTier = options?.keepRetryTier === true;
     const currentlyRetryTier = this.pendingRetrySet.has(id);
     const moveToRetryTier = keepRetryTier ? currentlyRetryTier : false;
@@ -923,9 +1236,46 @@ export class WeeklyFlowDownloadTracker {
     return true;
   }
 
+  _isCancelledAlbumJob(job) {
+    return Boolean(job?.requestGroupId) && isDownloadJobCancelled(job.id);
+  }
+
+  _isInterruptedCancellation(job) {
+    return job.status === "cancel_requested" || this._isCancelledAlbumJob(job);
+  }
+
+  setCancelRequested(id) {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "downloading") return false;
+    job.status = "cancel_requested";
+    this._update(job);
+    this._applyStatusDelta(job.playlistType, "downloading", job.status);
+    return true;
+  }
+
+  setCancelled(id) {
+    const job = this.jobs.get(id);
+    if (!job || !["pending", "downloading", "cancel_requested"].includes(job.status)) {
+      return false;
+    }
+    const previousStatus = job.status;
+    this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
+    this.pendingSet.delete(id);
+    this.pendingRetrySet.delete(id);
+    this._removeFromPendingQueues(id);
+    job.status = "cancelled";
+    job.retryCycle = false;
+    job.startedAt = null;
+    job.stagingPath = null;
+    job.completedAt = Date.now();
+    this._update(job);
+    this._applyStatusDelta(job.playlistType, previousStatus, job.status);
+    return true;
+  }
+
   setDone(id, finalPath, albumName = null, externalPath = null) {
     const job = this.jobs.get(id);
-    if (!job) return false;
+    if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
     this.pendingSet.delete(id);
@@ -949,7 +1299,7 @@ export class WeeklyFlowDownloadTracker {
 
   setFailed(id, error) {
     const job = this.jobs.get(id);
-    if (!job) return false;
+    if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
     this.pendingSet.delete(id);
@@ -966,7 +1316,7 @@ export class WeeklyFlowDownloadTracker {
 
   setBlocked(id, error, stagingPath = null) {
     const job = this.jobs.get(id);
-    if (!job) return false;
+    if (!job || this._isCancelledAlbumJob(job)) return false;
     const previousStatus = job.status;
     this.clearSlskdPipelineState(id, { clearDownloadMetadata: false });
     this.pendingSet.delete(id);
@@ -1018,6 +1368,16 @@ export class WeeklyFlowDownloadTracker {
     return sortByCreatedAt(jobs);
   }
 
+  getByPlaylistId(playlistId) {
+    const safePlaylistId = String(playlistId || "").trim();
+    if (!safePlaylistId) return [];
+    return sortByCreatedAt(
+      [...this.jobs.values()].filter(
+        (job) => job.playlistId === safePlaylistId || job.playlistType === safePlaylistId,
+      ),
+    );
+  }
+
   getByStatus(status) {
     const jobs = [];
     for (const job of this.jobs.values()) {
@@ -1049,6 +1409,10 @@ export class WeeklyFlowDownloadTracker {
   resetDownloadingToPending() {
     let count = 0;
     for (const job of this.jobs.values()) {
+      if (job.status === "cancel_requested" || (job.status === "downloading" && this._isCancelledAlbumJob(job))) {
+        this.setCancelled(job.id);
+        continue;
+      }
       if (job.status === "downloading") {
         const previousStatus = job.status;
         this.clearSlskdPipelineState(job.id);
@@ -1111,7 +1475,12 @@ export class WeeklyFlowDownloadTracker {
             recordTrackJobFailed(job, job.error || error);
           }
         })
-        .catch(() => {});
+        .catch((historyError) => {
+          logger.warn("history", "Could not record failed download jobs", {
+            jobCount: failedJobs.length,
+            reason: historyError?.message || String(historyError),
+          });
+        });
     }
     return count;
   }
@@ -1167,6 +1536,7 @@ export class WeeklyFlowDownloadTracker {
         toDelete.push(id);
       }
     }
+    cancelDownloadJobs(toDelete);
     for (const id of toDelete) {
       this.jobs.delete(id);
       if (cleanPending) {
@@ -1184,11 +1554,23 @@ export class WeeklyFlowDownloadTracker {
   }
 
   clearCompleted() {
-    return this._deleteJobsWhere((job) => job.status === "done" || job.status === "failed");
+    return this._deleteJobsWhere(
+      (job) =>
+        (job.status === "done" || job.status === "failed") &&
+        !(job.status === "done" && this.findActiveUpgradeJob(job)),
+    );
   }
 
   clearByPlaylistType(playlistType) {
     return this._deleteJobsWhere((job) => job.playlistType === playlistType);
+  }
+
+  clearByPlaylistId(playlistId) {
+    const safePlaylistId = String(playlistId || "").trim();
+    if (!safePlaylistId) return 0;
+    return this._deleteJobsWhere(
+      (job) => job.playlistId === safePlaylistId || job.playlistType === safePlaylistId,
+    );
   }
 
   clearPendingByPlaylistType(playlistType) {
@@ -1215,6 +1597,86 @@ export class WeeklyFlowDownloadTracker {
   getRevision() {
     return this.revision;
   }
+}
+
+const liveJobs = (rows) => rows.map(rowToJob);
+const emptyLiveStats = () => ({
+  total: 0, pending: 0, downloading: 0, blocked: 0, done: 0, failed: 0,
+});
+
+function readTrackerFromDatabase(name, args) {
+  const [first, second] = args;
+  if (name === "getJob") {
+    const row = liveJobStmt.get(first ?? null);
+    return row ? rowToJob(row) : null;
+  }
+  if (name === "getAll") return liveJobs(selectAllStmt.all());
+  if (name === "getByPlaylistType") {
+    const limit = Number(second);
+    const rows = Number.isFinite(limit) && limit > 0
+      ? livePlaylistJobsLimitedStmt.all(first ?? null, Math.floor(limit))
+      : livePlaylistJobsStmt.all(first ?? null);
+    return liveJobs(rows);
+  }
+  if (name === "getByPlaylistId") {
+    return liveJobs(livePlaylistIdJobsStmt.all(first ?? null, first ?? null));
+  }
+  if (name === "getByStatus") return liveJobs(liveStatusJobsStmt.all(first ?? null));
+  if (name === "getDoneWithFinalPath") {
+    const limit = Number.isFinite(Number(first)) && Number(first) > 0 ? Math.floor(Number(first)) : 500;
+    return liveJobs(liveDoneWithPathStmt.all(limit));
+  }
+  if (name === "getNextPending") {
+    const row = liveNextPendingStmt.get();
+    return row ? rowToJob(row) : null;
+  }
+  if (name === "peekPending") {
+    const limit = Number.isFinite(Number(first)) && Number(first) > 0 ? Math.floor(Number(first)) : 10;
+    return liveJobs(livePendingStmt.all(limit));
+  }
+  if (name === "hasActiveJobsForPlaylist") {
+    return !!liveActivePlaylistStmt.get(first ?? null);
+  }
+  if (name === "getRevision") return persistedRevisionStmt.get()?.revision || 0;
+  if (name === "getStats" || name === "getStatsByPlaylistType" || name === "getPlaylistTypeStats") {
+    const byPlaylist = {};
+    const totals = emptyLiveStats();
+    for (const row of liveStatsStmt.all()) {
+      const count = Number(row.count) || 0;
+      if (!byPlaylist[row.playlist_type]) byPlaylist[row.playlist_type] = emptyLiveStats();
+      if (row.status in totals) {
+        byPlaylist[row.playlist_type][row.status] += count;
+        byPlaylist[row.playlist_type].total += count;
+        totals[row.status] += count;
+        totals.total += count;
+      }
+    }
+    if (name === "getStats") return totals;
+    if (name === "getPlaylistTypeStats") return byPlaylist[String(first)] || emptyLiveStats();
+    if (!Array.isArray(first) || first.length === 0) return byPlaylist;
+    return Object.fromEntries(first.map((id) => [id, byPlaylist[id] || emptyLiveStats()]));
+  }
+  return undefined;
+}
+
+const LIVE_READ_METHODS = new Set([
+  "getJob", "getAll", "getByPlaylistType", "getByPlaylistId", "getByStatus", "getDoneWithFinalPath",
+  "getNextPending", "peekPending", "hasActiveJobsForPlaylist", "getRevision",
+  "getStats", "getStatsByPlaylistType", "getPlaylistTypeStats",
+]);
+
+for (const name of Object.getOwnPropertyNames(WeeklyFlowDownloadTracker.prototype)) {
+  if (name === "constructor" || name.startsWith("_")) continue;
+  const original = WeeklyFlowDownloadTracker.prototype[name];
+  if (typeof original !== "function") continue;
+  WeeklyFlowDownloadTracker.prototype[name] = function (...args) {
+    if (process.env.NODE_ENV !== "test" && process.env.AURRAL_TEST_SERVER !== "1" &&
+        process.env.AURRAL_BACKGROUND_WORKER_GROUP !== "flow" && LIVE_READ_METHODS.has(name)) {
+      return readTrackerFromDatabase(name, args);
+    }
+    this._refreshExternalChanges();
+    return original.apply(this, args);
+  };
 }
 
 export const downloadTracker = new WeeklyFlowDownloadTracker();

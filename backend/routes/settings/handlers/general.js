@@ -14,6 +14,7 @@ import {
   resolveYtdlpStagingRoot,
   validateDownloadFolderPath,
   computeLibraryRootOverlaps,
+  getOverlapCheckedLidarrRoots,
 } from "../../../services/downloadFolderConfig.js";
 import { normalizePathMappings } from "../../../services/pathMappings.js";
 import { logger } from "../../../services/logger.js";
@@ -35,16 +36,7 @@ function mergeIntegrations(existing, input, keys) {
 
 function resolveLibraryRootWarnings(settings) {
   const aurralRoot = settings?.downloadFolderPath || resolvePlaylistRoot();
-  const configuredLidarr = settings?.integrations?.lidarr || {};
-  const lidarrRoots =
-    configuredLidarr.enabled === false
-      ? []
-      : [
-          ...(Array.isArray(configuredLidarr.rootFolderPaths)
-            ? configuredLidarr.rootFolderPaths
-            : []),
-          configuredLidarr.rootFolderPath,
-        ];
+  const lidarrRoots = getOverlapCheckedLidarrRoots(settings?.integrations?.lidarr);
   return computeLibraryRootOverlaps({ aurralRoot, lidarrRoots });
 }
 
@@ -412,7 +404,22 @@ export function registerGeneral(router) {
         integrations.news = nextNews;
       }
 
-      const INTEGRATION_KEYS = ["lidarr", "navidrome", "jellyfin", "slskd", "prowlarr", "nzbget", "sabnzbd", "ytdlp", "deemix", "lastfm", "ticketmaster", "news", "metadata", "general", "gotify", "webhookEvents"];
+      if (integrations?.google?.redirectUri !== undefined) {
+        const trimmedRedirectUri = String(integrations.google.redirectUri).trim();
+        if (trimmedRedirectUri) {
+          const redirectValidation = validateExternalUrl(trimmedRedirectUri);
+          if (!redirectValidation.valid) {
+            return res.status(400).json({
+              error: `Invalid Google redirect URI: ${redirectValidation.error}`,
+            });
+          }
+          integrations.google.redirectUri = redirectValidation.url;
+        } else {
+          integrations.google.redirectUri = "";
+        }
+      }
+
+      const INTEGRATION_KEYS = ["lidarr", "navidrome", "jellyfin", "slskd", "prowlarr", "nzbget", "sabnzbd", "ytdlp", "deemix", "lastfm", "ticketmaster", "news", "metadata", "general", "gotify", "webhookEvents", "google"];
       let mergedIntegrations =
         currentSettings.integrations || defaultData.settings.integrations || {};
       if (integrations) {

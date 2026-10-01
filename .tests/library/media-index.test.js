@@ -8,13 +8,14 @@ import { db } from "../../backend/config/db-sqlite.js";
 import {
   getCanonicalArtistProjection,
   getCanonicalLibrary,
+  getCanonicalLibraryLastModified,
   getCanonicalLibraryPage,
   invalidateCanonicalLibraryCache,
 } from "../../backend/services/libraryQueryService.js";
 import {
   buildFallbackIdentityKey,
-  getLibrarySnapshot,
   linkLibraryAlbumTrack,
+  removeLibraryTrackIfNoAvailableMedia,
   upsertLibraryAlbum,
   upsertLibraryArtist,
   upsertLibraryMediaFile,
@@ -28,6 +29,16 @@ import {
 } from "../../backend/services/libraryFileScanner.js";
 import { indexLidarrLibrary } from "../../backend/services/libraryLidarrIndexer.js";
 import { scanConfiguredLibrary } from "../../backend/services/libraryIndexService.js";
+import { dbOps } from "../../backend/db/helpers/index.js";
+import { clearMetadataProviderCaches } from "../../backend/services/providers/brainzmashProvider.js";
+import { createMockHttpServer } from "../helpers/backendTestHarness.js";
+
+const getLibrarySnapshot = () => ({
+  artists: db.prepare("SELECT * FROM library_artists ORDER BY name").all(),
+  albums: db.prepare("SELECT * FROM library_albums ORDER BY title").all(),
+  tracks: db.prepare("SELECT * FROM library_tracks ORDER BY title").all(),
+  files: db.prepare("SELECT * FROM library_media_files ORDER BY path").all(),
+});
 
 test("scan change tracking ignores unrelated database writes", async () => {
   const settingKey = `unrelated-scan-write-${process.pid}`;
@@ -538,6 +549,109 @@ test("upsertLibraryArtist merges normalized name variants when the MBID row exis
     );
   } finally {
     db.prepare("DELETE FROM library_artists WHERE name LIKE ?").run(`%${suffix}`);
+  }
+});
+
+test("a configured scan resolves untagged artists only on one unambiguous MusicBrainz match", async () => {
+  const suffix = `${process.pid}${Date.now()}`;
+  const names = {
+    renamed: `Bravery${suffix}, The`,
+    merged: `Pumpkins${suffix}`,
+    ambiguous: `Nirvana${suffix}`,
+    offline: `Offline${suffix}`,
+  };
+  const mbids = {
+    renamed: "44444444-4444-4444-8444-444444444441",
+    merged: "44444444-4444-4444-8444-444444444442",
+    ambiguousOne: "44444444-4444-4444-8444-444444444443",
+    ambiguousTwo: "44444444-4444-4444-8444-444444444444",
+    offline: "44444444-4444-4444-8444-444444444445",
+  };
+  let offlineAvailable = false;
+  const server = await createMockHttpServer((request, response) => {
+    const query = new URL(request.url, "http://mock").searchParams.get("query");
+    const results = {
+      [names.renamed]: [{ id: mbids.renamed, artistname: `The Bravery${suffix}` }],
+      [names.merged]: [
+        { id: mbids.merged, artistname: `The Pumpkins${suffix}`, artistaliases: [names.merged] },
+        { id: "44444444-4444-4444-8444-444444444449", artistname: `Pumpkins${suffix} Tribute` },
+      ],
+      [names.ambiguous]: [
+        { id: mbids.ambiguousOne, artistname: names.ambiguous },
+        { id: mbids.ambiguousTwo, artistname: names.ambiguous },
+      ],
+      [names.offline]: [{ id: mbids.offline, artistname: names.offline }],
+    }[query] || [];
+    if (query === names.offline && !offlineAvailable) {
+      response.writeHead(500);
+      response.end();
+      return;
+    }
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify(results));
+  });
+  const originalSettings = dbOps.getSettings();
+  dbOps.updateSettings({
+    ...originalSettings,
+    integrations: {
+      ...originalSettings.integrations,
+      metadata: {
+        ...originalSettings.integrations.metadata,
+        baseUrl: server.url,
+        enableNarrowFallbacks: false,
+      },
+    },
+  });
+  clearMetadataProviderCaches();
+  const root = await mkdtemp(path.join(tmpdir(), "aurral-unmatched-artists-"));
+  const existing = upsertLibraryArtist({
+    identityKey: `mbid:${mbids.merged}`,
+    mbid: mbids.merged,
+    name: `The Pumpkins${suffix}`,
+  });
+  const artistFor = (name) => db.prepare(
+    `SELECT artist.id, artist.mbid, artist.name
+     FROM library_albums AS album
+     JOIN library_artists AS artist ON artist.id = album.artist_id
+     WHERE album.title = ?`,
+  ).get(`${name} Album`);
+
+  try {
+    for (const name of [names.renamed, names.merged, names.ambiguous]) {
+      await createAudioFile(root, `${name}/${name} Album/01 Track.mp3`);
+    }
+    await scanConfiguredLibrary({ musicRoot: root, includeLidarr: false });
+
+    assert.deepEqual(
+      { mbid: artistFor(names.renamed).mbid, name: artistFor(names.renamed).name },
+      { mbid: mbids.renamed, name: names.renamed },
+    );
+    assert.equal(artistFor(names.merged).id, existing.id);
+    assert.equal(
+      db.prepare("SELECT COUNT(*) AS count FROM library_artists WHERE name = ?").get(names.merged).count,
+      0,
+    );
+    assert.equal(artistFor(names.ambiguous).mbid, null);
+
+    await createAudioFile(root, `${names.offline}/${names.offline} Album/01 Track.mp3`);
+    await scanConfiguredLibrary({ musicRoot: root, includeLidarr: false });
+    assert.equal(artistFor(names.offline).mbid, null);
+
+    offlineAvailable = true;
+    clearMetadataProviderCaches();
+    await scanConfiguredLibrary({ musicRoot: root, includeLidarr: false });
+    assert.equal(artistFor(names.offline).mbid, mbids.offline);
+  } finally {
+    for (const filePath of getLibrarySnapshot().files.map((file) => file.path)) {
+      if (filePath.startsWith(root)) deleteIndexedFile("aurral", filePath);
+    }
+    db.prepare("DELETE FROM library_artists WHERE name LIKE ?").run(`%${suffix}%`);
+    db.prepare("DELETE FROM musicbrainz_artist_mbid_cache WHERE artist_name_key LIKE ?")
+      .run(`%${suffix}%`);
+    clearMetadataProviderCaches();
+    dbOps.updateSettings(originalSettings);
+    await server.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -1735,5 +1849,69 @@ test("a Lidarr rescan marks the final removed media file unavailable", async () 
   } finally {
     if (filePath) deleteIndexedFile("lidarr", filePath);
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("album/track relation changes move the canonical library timestamp", async () => {
+  const identityKey = `name:relation-timestamp-${process.pid}`;
+  const artist = upsertLibraryArtist({ identityKey, name: "Relation Timestamp", syncSearch: false });
+  const album = upsertLibraryAlbum({
+    identityKey: `${identityKey}:album`,
+    artistId: artist.id,
+    title: "Relation Timestamp Album",
+    syncSearch: false,
+  });
+  const tracks = ["kept", "dropped"].map((suffix) => upsertLibraryTrack({
+    identityKey: `${identityKey}:${suffix}`,
+    title: `Relation Timestamp ${suffix}`,
+    artistName: "Relation Timestamp",
+    syncSearch: false,
+  }));
+  const albumUpdatedAt = () =>
+    db.prepare("SELECT updated_at FROM library_albums WHERE id = ?").get(album.id)?.updated_at;
+  // Park the timestamp in the past so a bump is unambiguous at millisecond resolution.
+  const parkTimestamp = () =>
+    db.prepare("UPDATE library_albums SET updated_at = 1 WHERE id = ?").run(album.id);
+  const relationCount = () =>
+    db.prepare("SELECT COUNT(*) AS total FROM library_album_tracks WHERE album_id = ?")
+      .get(album.id).total;
+
+  try {
+    linkLibraryAlbumTrack({ albumId: album.id, trackId: tracks[0].id, syncSearch: false });
+    upsertLibraryMediaFile({
+      trackId: tracks[0].id,
+      albumId: album.id,
+      source: "aurral",
+      path: `/tmp/relation-timestamp-${process.pid}.flac`,
+      available: true,
+    });
+
+    parkTimestamp();
+    linkLibraryAlbumTrack({ albumId: album.id, trackId: tracks[1].id, syncSearch: false });
+    assert.equal(relationCount(), 2);
+    assert.ok(albumUpdatedAt() > 1, "linking a track must refresh the album timestamp");
+    assert.ok(getCanonicalLibraryLastModified() >= albumUpdatedAt());
+
+    upsertLibraryMediaFile({
+      trackId: tracks[1].id,
+      albumId: album.id,
+      source: "aurral",
+      path: `/tmp/relation-timestamp-dropped-${process.pid}.flac`,
+      available: false,
+    });
+    parkTimestamp();
+    assert.equal(removeLibraryTrackIfNoAvailableMedia(tracks[1].id), true);
+    assert.equal(relationCount(), 1);
+    assert.ok(albumUpdatedAt() > 1, "dropping a track must refresh the album timestamp");
+    assert.ok(getCanonicalLibraryLastModified() >= albumUpdatedAt());
+  } finally {
+    for (const track of tracks) {
+      db.prepare("DELETE FROM library_media_files WHERE track_id = ?").run(track.id);
+      db.prepare("DELETE FROM library_album_tracks WHERE track_id = ?").run(track.id);
+      db.prepare("DELETE FROM library_tracks WHERE id = ?").run(track.id);
+    }
+    db.prepare("DELETE FROM library_albums WHERE id = ?").run(album.id);
+    db.prepare("DELETE FROM library_artists WHERE id = ?").run(artist.id);
+    invalidateCanonicalLibraryCache();
   }
 });

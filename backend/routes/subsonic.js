@@ -1,3 +1,4 @@
+import path from "path";
 import express from "express";
 
 import { APP_NAME, APP_VERSION } from "../config/constants.js";
@@ -10,8 +11,10 @@ import {
   getArtistInfo,
   getFlowPlaylist,
   getFlowPlaylists,
+  getLibraryLastModified,
   getGenres,
   getMusicDirectory,
+  getRandomSongs,
   getSong,
   getSongsByGenre,
   getStarred,
@@ -27,25 +30,47 @@ import {
   updateSubsonicPlaylist,
   unstarMany,
 } from "../services/subsonicLibraryService.js";
+import {
+  getLibraryScanStatus,
+  getScheduledLibraryScanJobId,
+} from "../services/libraryScanWorker.js";
 import { recordPlayEvent } from "../services/playEventService.js";
 import { logger } from "../services/logger.js";
 
 const SUBSONIC_VERSION = "1.16.1";
 const SUBSONIC_NAMESPACE = "http://subsonic.org/restapi";
+const SUBSONIC_AUTH_HELP_URL = "https://docs.aurral.org/api/overview/";
+const IGNORED_ARTICLES = "The El La Los Las Le Les";
+// OpenSubsonic extensions this server implements, advertised by getOpenSubsonicExtensions.
+const SUPPORTED_EXTENSIONS = [
+  { name: "formPost", versions: [1] },
+  { name: "topSongsByArtistId", versions: [1] },
+];
 const router = express.Router();
 
+// OpenSubsonic formPost: parameters may arrive in a urlencoded body; query wins on conflicts.
+const requestParameters = (req) => ({
+  ...(req.body && typeof req.body === "object" ? req.body : {}),
+  ...(req.query || {}),
+});
+
 const getParameter = (req, name) => {
-  const value = req.query?.[name];
+  const value = requestParameters(req)[name];
   return String(Array.isArray(value) ? value[0] || "" : value || "");
 };
 
 const getParameters = (req, names) =>
   names.flatMap((name) => {
-    const value = req.query?.[name];
+    const value = requestParameters(req)[name];
     return (Array.isArray(value) ? value : [value])
       .map((entry) => String(entry || "").trim())
       .filter(Boolean);
   });
+
+const normalizeSearchQuery = (value) => {
+  const query = String(value || "").trim();
+  return query === '""' ? "" : query;
+};
 
 const escapeXml = (value) =>
   String(value)
@@ -73,6 +98,7 @@ function responseAttributes(status) {
     version: SUBSONIC_VERSION,
     type: APP_NAME,
     serverVersion: APP_VERSION,
+    openSubsonic: true,
   };
 }
 
@@ -85,11 +111,11 @@ function renderXmlElement(name, value) {
     return `<${name}>${escapeXml(value)}</${name}>`;
   }
 
-  const text = name === "genre" && Object.hasOwn(value, "value") ? value.value : null;
+  const text = Object.hasOwn(value, "value") ? value.value : null;
   const attributes = [];
   const children = [];
   for (const [key, entry] of Object.entries(value)) {
-    if (XML_OMIT_FIELDS.has(key) || (name === "genre" && key === "value")) continue;
+    if (XML_OMIT_FIELDS.has(key) || key === "value") continue;
     if (entry == null || entry === undefined) continue;
     if (typeof entry === "object") children.push(renderXmlElement(key, entry));
     else attributes.push(`${key}="${escapeXml(entry)}"`);
@@ -100,11 +126,11 @@ function renderXmlElement(name, value) {
 }
 
 function renderXml({ status, data = {}, error }) {
-  const attributes = Object.entries({ status, version: SUBSONIC_VERSION })
+  const attributes = Object.entries(responseAttributes(status))
     .map(([key, value]) => `${key}="${escapeXml(value)}"`)
     .join(" ");
   const body = error
-    ? `<error code="${error.code}" message="${escapeXml(error.message)}"/>`
+    ? renderXmlElement("error", error)
     : Object.entries(data)
         .map(([key, value]) => renderXmlElement(key, value))
         .join("");
@@ -126,8 +152,8 @@ function sendResponse(res, format, status = "ok", error = null, data = {}) {
   );
 }
 
-function sendError(res, format, code, message) {
-  return sendResponse(res, format, "failed", { code, message });
+function sendError(res, format, code, message, helpUrl = undefined) {
+  return sendResponse(res, format, "failed", { code, message, helpUrl });
 }
 
 function requestedFormat(req) {
@@ -138,15 +164,26 @@ function requestedFormat(req) {
 function validateRequest(req, format) {
   if (!format) return { format: "xml", error: [0, "Unsupported response format. Use xml or json."] };
 
-  for (const parameter of ["u", "v", "c"]) {
+  const apiKey = getParameter(req, "apiKey");
+  for (const parameter of ["v", "c"]) {
     if (!getParameter(req, parameter)) {
       return { format, error: [10, `Required parameter is missing: ${parameter}`] };
     }
+  }
+  if (!apiKey && !getParameter(req, "u")) {
+    return { format, error: [10, "Required parameter is missing: u"] };
   }
 
   const password = getParameter(req, "p");
   const token = getParameter(req, "t");
   const salt = getParameter(req, "s");
+  const providedMechanisms = Number(Boolean(password)) + Number(Boolean(token || salt)) + Number(Boolean(apiKey));
+  if (providedMechanisms > 1 || (apiKey && getParameter(req, "u"))) {
+    return { format, error: [43, "Multiple conflicting authentication mechanisms provided"] };
+  }
+  if (apiKey) {
+    return { format, error: [42, "API key authentication is not supported"] };
+  }
   if (!password && !(token && salt)) {
     return { format, error: [10, "Required parameter is missing: p or t/s"] };
   }
@@ -181,6 +218,14 @@ function handleBinaryError(res, message = "Requested media was not found") {
 }
 
 async function handleSubsonicRequest(req, res) {
+  const method = String(req.params.method || "").replace(/\.view$/i, "").toLowerCase();
+  if (method === "getopensubsonicextensions") {
+    // Must be reachable without any authentication parameters so clients can probe capabilities.
+    const format = requestedFormat(req);
+    if (!format) return sendError(res, "xml", 0, "Unsupported response format. Use xml or json.");
+    return sendResponse(res, format, "ok", null, { openSubsonicExtensions: SUPPORTED_EXTENSIONS });
+  }
+
   const validation = validateRequest(req, requestedFormat(req));
   if (validation.error) return sendError(res, validation.format, ...validation.error);
 
@@ -197,16 +242,12 @@ async function handleSubsonicRequest(req, res) {
       method: req.params.method,
       authentication: password ? "password" : "token",
     });
-    return sendError(
-      res,
-      format,
-      password ? 40 : 41,
-      password ? "Wrong username or password" : "Token authentication failed",
-    );
+    return password
+      ? sendError(res, format, 40, "Wrong username or password")
+      : sendError(res, format, 41, "Token authentication failed", SUBSONIC_AUTH_HELP_URL);
   }
   req.user = user;
 
-  const method = String(req.params.method || "").replace(/\.view$/i, "").toLowerCase();
   if (method === "ping") return sendResponse(res, format);
   if (method === "getuser") {
     const isAdmin = req.user.role === "admin";
@@ -244,6 +285,7 @@ async function handleSubsonicRequest(req, res) {
           title: song.title,
           artist: song.artist,
           album: song.album,
+          albumId: song.albumId,
           durationMs: Number(song.duration || 0) * 1000,
           playedAt: times[index] || undefined,
           source: "subsonic",
@@ -260,9 +302,35 @@ async function handleSubsonicRequest(req, res) {
       musicFolders: { musicFolder: [{ id: 1, name: APP_NAME }] },
     });
   }
-  if (method === "getalbumlist2") {
+  if (method === "getscanstatus") {
+    const jobId = getScheduledLibraryScanJobId();
+    const status = jobId == null ? null : getLibraryScanStatus(jobId);
     return sendResponse(res, format, "ok", null, {
-      albumList2: {
+      scanStatus: {
+        scanning: status?.status === "queued" || status?.status === "running",
+      },
+    });
+  }
+  if (method === "getnowplaying") {
+    return sendResponse(res, format, "ok", null, { nowPlaying: { entry: [] } });
+  }
+  if (method === "getbookmarks") {
+    return sendResponse(res, format, "ok", null, { bookmarks: { bookmark: [] } });
+  }
+  if (method === "getplayqueue") {
+    return sendResponse(res, format, "ok", null, {
+      playQueue: {
+        username: user.username,
+        changed: new Date(0).toISOString(),
+        changedBy: APP_NAME,
+        entry: [],
+      },
+    });
+  }
+  if (method === "getalbumlist" || method === "getalbumlist2") {
+    const responseKey = method === "getalbumlist" ? "albumList" : "albumList2";
+    return sendResponse(res, format, "ok", null, {
+      [responseKey]: {
         album: getAlbumList({
           fromYear: getParameter(req, "fromYear"),
           genre: getParameter(req, "genre"),
@@ -270,7 +338,8 @@ async function handleSubsonicRequest(req, res) {
           size: getParameter(req, "size"),
           toYear: getParameter(req, "toYear"),
           type: getParameter(req, "type"),
-        }),
+          musicFolderId: getParameter(req, "musicFolderId"),
+        }, user),
       },
     });
   }
@@ -285,22 +354,43 @@ async function handleSubsonicRequest(req, res) {
         song: getSongsByGenre(genre, {
           count: getParameter(req, "count"),
           offset: getParameter(req, "offset"),
-        }),
+          musicFolderId: getParameter(req, "musicFolderId"),
+        }, user),
       },
     });
   }
-  if (method === "getartists" || method === "getindexes") {
-    const indexes = groupArtists(listArtists());
+  if (method === "getrandomsongs") {
     return sendResponse(res, format, "ok", null, {
-      [method === "getartists" ? "artists" : "indexes"]: {
-        ignoredArticles: "The El La Los Las Le Les",
-        ...(method === "getindexes" ? { lastModified: Date.now() } : {}),
-        index: indexes,
+      randomSongs: {
+        song: getRandomSongs({
+          fromYear: getParameter(req, "fromYear"),
+          genre: getParameter(req, "genre"),
+          size: getParameter(req, "size"),
+          toYear: getParameter(req, "toYear"),
+          musicFolderId: getParameter(req, "musicFolderId"),
+        }, user),
+      },
+    });
+  }
+  if (method === "getartists") {
+    return sendResponse(res, format, "ok", null, {
+      artists: { ignoredArticles: IGNORED_ARTICLES, index: groupArtists(listArtists(user)) },
+    });
+  }
+  if (method === "getindexes") {
+    const lastModified = getLibraryLastModified(user);
+    const ifModifiedSince = Number.parseInt(getParameter(req, "ifModifiedSince"), 10);
+    const unchanged = Number.isFinite(ifModifiedSince) && ifModifiedSince >= lastModified;
+    return sendResponse(res, format, "ok", null, {
+      indexes: {
+        ignoredArticles: IGNORED_ARTICLES,
+        lastModified,
+        ...(unchanged ? {} : { index: groupArtists(listArtists(user)) }),
       },
     });
   }
   if (method === "getartist") {
-    const artist = getArtist(getParameter(req, "id"));
+    const artist = getArtist(getParameter(req, "id"), user);
     return artist
       ? sendResponse(res, format, "ok", null, { artist })
       : sendError(res, format, 70, "Requested data was not found");
@@ -311,8 +401,32 @@ async function handleSubsonicRequest(req, res) {
       ? sendResponse(res, format, "ok", null, { artistInfo })
       : sendError(res, format, 70, "Requested data was not found");
   }
+  if (method === "getartistinfo2") {
+    const artistInfo2 = getArtistInfo(getParameter(req, "id"));
+    return artistInfo2
+      ? sendResponse(res, format, "ok", null, { artistInfo2 })
+      : sendError(res, format, 70, "Requested data was not found");
+  }
+  if (method === "getalbuminfo" || method === "getalbuminfo2") {
+    return getAlbum(getParameter(req, "id"))
+      ? sendResponse(res, format, "ok", null, { albumInfo: {} })
+      : sendError(res, format, 70, "Requested data was not found");
+  }
+  if (method === "getlyrics") {
+    return sendResponse(res, format, "ok", null, { lyrics: { value: "" } });
+  }
+  if (method === "getinternetradiostations") {
+    return sendResponse(res, format, "ok", null, { internetRadioStations: { internetRadioStation: [] } });
+  }
+  if (method === "getpodcasts") {
+    return sendResponse(res, format, "ok", null, { podcasts: { channel: [] } });
+  }
+  if (method === "getsimilarsongs" || method === "getsimilarsongs2") {
+    const key = method === "getsimilarsongs" ? "similarSongs" : "similarSongs2";
+    return sendResponse(res, format, "ok", null, { [key]: { song: [] } });
+  }
   if (method === "getalbum") {
-    const album = getAlbum(getParameter(req, "id"));
+    const album = getAlbum(getParameter(req, "id"), user);
     return album
       ? sendResponse(res, format, "ok", null, { album })
       : sendError(res, format, 70, "Requested data was not found");
@@ -324,15 +438,15 @@ async function handleSubsonicRequest(req, res) {
       : sendError(res, format, 70, "Requested data was not found");
   }
   if (method === "getmusicdirectory") {
-    const directory = getMusicDirectory(getParameter(req, "id"));
+    const directory = getMusicDirectory(getParameter(req, "id"), user);
     return directory
       ? sendResponse(res, format, "ok", null, { directory })
       : sendError(res, format, 70, "Requested data was not found");
   }
   if (method === "search3" || method === "search2") {
-    const query = getParameter(req, "query");
+    const query = normalizeSearchQuery(getParameter(req, "query"));
     return sendResponse(res, format, "ok", null, {
-      [method === "search3" ? "searchResult3" : "searchResult2"]: searchLibrary(query, req.query),
+      [method === "search3" ? "searchResult3" : "searchResult2"]: searchLibrary(query, requestParameters(req), user),
     });
   }
   if (method === "getplaylists") {
@@ -346,15 +460,15 @@ async function handleSubsonicRequest(req, res) {
     }
     try {
       const playlist = playlistId
-        ? updateSubsonicPlaylist(user, {
+        ? await updateSubsonicPlaylist(user, {
             playlistId,
             name: name || undefined,
-            comment: Object.hasOwn(req.query || {}, "comment")
+            comment: Object.hasOwn(requestParameters(req), "comment")
               ? getParameter(req, "comment")
               : undefined,
             songIdsToAdd: getParameters(req, ["songId"]),
           })
-        : createSubsonicPlaylist(user, {
+        : await createSubsonicPlaylist(user, {
             name,
             songIds: getParameters(req, ["songId"]),
           });
@@ -384,11 +498,15 @@ async function handleSubsonicRequest(req, res) {
       : sendError(res, format, 70, "Requested data was not found");
   }
   if (method === "gettopsongs") {
-    const artist = String(getParameter(req, "artist") || "").trim();
+    // OpenSubsonic topSongsByArtistId: an artist id takes precedence over the artist name.
+    const artistId = getParameter(req, "id");
+    const resolvedArtist = artistId ? getArtist(artistId) : null;
+    if (artistId && !resolvedArtist) return sendError(res, format, 70, "Requested data was not found");
+    const artist = resolvedArtist?.name || String(getParameter(req, "artist") || "").trim();
     if (!artist) return sendError(res, format, 10, "Required parameter is missing: artist");
     return sendResponse(res, format, "ok", null, {
       topSongs: {
-        song: getTopSongs(artist, { count: getParameter(req, "count") }),
+        song: getTopSongs(artist, { count: getParameter(req, "count") }, user),
       },
     });
   }
@@ -405,10 +523,10 @@ async function handleSubsonicRequest(req, res) {
       .map((value) => Number.parseInt(value, 10))
       .filter((value) => Number.isInteger(value) && value >= 0);
     try {
-      const playlist = updateSubsonicPlaylist(user, {
+      const playlist = await updateSubsonicPlaylist(user, {
         playlistId,
-        name: Object.hasOwn(req.query || {}, "name") ? getParameter(req, "name") : undefined,
-        comment: Object.hasOwn(req.query || {}, "comment")
+        name: Object.hasOwn(requestParameters(req), "name") ? getParameter(req, "name") : undefined,
+        comment: Object.hasOwn(requestParameters(req), "comment")
           ? getParameter(req, "comment")
           : undefined,
         songIdsToAdd: getParameters(req, ["songIdToAdd"]),
@@ -427,21 +545,28 @@ async function handleSubsonicRequest(req, res) {
   if (method === "deleteplaylist") {
     const playlistId = getParameter(req, "id");
     if (!playlistId) return sendError(res, format, 10, "Required parameter is missing: id");
-    return deleteSubsonicPlaylist(user, playlistId)
-      ? sendResponse(res, format)
-      : sendError(res, format, 70, "Requested data was not found");
+    try {
+      return await deleteSubsonicPlaylist(user, playlistId)
+        ? sendResponse(res, format)
+        : sendError(res, format, 70, "Requested data was not found");
+    } catch {
+      return sendError(res, format, 0, "Failed to delete playlist");
+    }
   }
   if (method === "stream" || method === "download") {
     const filePath = resolveStreamPath(getParameter(req, "id"), user);
     if (!filePath) return handleBinaryError(res, "Track file missing");
-    const streamed = await streamAudioFile(req, res, filePath);
+    const streamed = await streamAudioFile(res, filePath);
     return streamed || res.headersSent ? undefined : handleBinaryError(res, "Track file missing");
   }
   if (method === "getcoverart") {
     const playlistArtwork = await resolvePlaylistArtwork(getParameter(req, "id"), user);
     if (playlistArtwork) {
       res.set("Cache-Control", "private, max-age=86400");
-      return res.sendFile(playlistArtwork.safePath);
+      return res.sendFile(path.basename(playlistArtwork.safePath), {
+        root: path.dirname(playlistArtwork.safePath),
+        dotfiles: "allow",
+      });
     }
     const artworkUrl = await resolveArtworkUrl(getParameter(req, "id"));
     if (!artworkUrl) return handleBinaryError(res, "Cover art not found");

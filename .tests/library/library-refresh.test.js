@@ -11,6 +11,7 @@ const { registerCanonical } = await import(
 );
 const {
   claimScheduledLibraryScanJob,
+  beginLibraryScanJob,
   clearScheduledLibraryScan,
   getScheduledLibraryScanJobId,
   onLibraryScanFinalFailure,
@@ -26,7 +27,8 @@ const { beginLibraryScan, finishLibraryScan } = await import(
 const { processSystemTask } = await import("../../backend/services/systemTaskWorker.js");
 const {
   getLibraryScanQueue,
-  SCHEDULED_SYSTEM_TASKS,
+  bootstrapHonkerSchedules,
+  getHonkerDb,
 } = await import("../../backend/services/honkerDb.js");
 const { createLibraryFileWatcher, resolveLibraryWatchRoots } = await import(
   "../../backend/services/libraryFileWatcher.js"
@@ -34,10 +36,8 @@ const { createLibraryFileWatcher, resolveLibraryWatchRoots } = await import(
 const { lidarrClient } = await import("../../backend/services/lidarrClient.js");
 
 test("library scans are not scheduled as a recurring background task", () => {
-  assert.equal(
-    SCHEDULED_SYSTEM_TASKS.some((task) => task.name === "library-index-refresh"),
-    false,
-  );
+  bootstrapHonkerSchedules();
+  assert.equal(getHonkerDb().scheduler().list().some((task) => task.queue === "library-scan"), false);
 });
 
 test("library bootstrap runs only until the first completed scan", async () => {
@@ -63,7 +63,7 @@ test("library bootstrap runs only until the first completed scan", async () => {
   }
 });
 
-test("library refresh queues a forced scan and exposes its queue status", async () => {
+test("library refresh queues a quick or full scan and exposes its queue status", async () => {
   const existingJobId = Number(dbOps.getJSONSetting("pendingLibraryScanJob")?.jobId);
   if (Number.isSafeInteger(existingJobId)) getLibraryScanQueue().cancel(existingJobId);
   clearScheduledLibraryScan();
@@ -92,17 +92,38 @@ test("library refresh queues a forced scan and exposes its queue status", async 
     },
   };
 
+  const queuedPayload = (jobId) => JSON.parse(getLibraryScanQueue().getJob(jobId).payload);
+
   try {
+    await routes.get("POST /refresh")({ user: { id: 1 }, body: { mode: "bogus" } }, response);
+    assert.equal(statusCode, 400);
+    assert.equal(dbOps.getJSONSetting("pendingLibraryScanJob")?.jobId, undefined);
+
     await routes.get("POST /refresh")({ user: { id: 1 } }, response);
     assert.equal(statusCode, 202);
     assert.equal(body.queued, true);
     assert.equal(body.status.status, "queued");
-    assert.deepEqual(JSON.parse(getLibraryScanQueue().getJob(body.jobId).payload), {
-      force: true,
+    assert.deepEqual(queuedPayload(body.jobId), {
+      force: false,
       includeLidarr: true,
+      changedPaths: null,
     });
+    getLibraryScanQueue().cancel(body.jobId);
+    clearScheduledLibraryScan();
+
+    await routes.get("POST /refresh")({ user: { id: 1 }, body: { mode: "full" } }, response);
+    assert.equal(statusCode, 202);
+    assert.equal(queuedPayload(body.jobId).force, true);
+    getLibraryScanQueue().cancel(body.jobId);
+    clearScheduledLibraryScan();
+
+    await routes.get("POST /refresh")({ user: { id: 1 }, body: { mode: "quick" } }, response);
+    assert.equal(queuedPayload(body.jobId).force, false);
     const jobId = body.jobId;
     refreshJobId = jobId;
+    await routes.get("POST /refresh")({ user: { id: 1 }, body: { mode: "full" } }, response);
+    assert.equal(body.jobId, jobId);
+    assert.equal(beginLibraryScanJob(jobId, queuedPayload(jobId)).force, true);
 
     body = undefined;
     await routes.get("GET /refresh")({ user: { id: 1 } }, response);
@@ -168,6 +189,7 @@ test("library refresh replaces a scan whose processing claim expired", () => {
     assert.deepEqual(JSON.parse(queue.getJob(replacementJobId).payload), {
       force: true,
       includeLidarr: true,
+      changedPaths: null,
     });
   } finally {
     if (staleJobId) queue.cancel(staleJobId);
@@ -185,6 +207,7 @@ test("a full refresh upgrades a pending local-only scan", () => {
     assert.deepEqual(JSON.parse(queue.getJob(jobId).payload), {
       force: false,
       includeLidarr: false,
+      changedPaths: null,
     });
     assert.equal(scheduleLibraryScan({ includeLidarr: true }), jobId);
     assert.equal(dbOps.getJSONSetting("pendingLibraryScanJob").includeLidarr, true);
@@ -207,8 +230,8 @@ test("pending watcher scans merge changed paths into one job", () => {
       changedPaths: ["/data/music/Artist/Album/02 Track.flac"],
     }), jobId);
     assert.deepEqual(dbOps.getJSONSetting("pendingLibraryScanJob").changedPaths, [
-      "/data/music/Artist/Album/01 Track.flac",
-      "/data/music/Artist/Album/02 Track.flac",
+      path.resolve("/data/music/Artist/Album/01 Track.flac"),
+      path.resolve("/data/music/Artist/Album/02 Track.flac"),
     ]);
   } finally {
     if (jobId) queue.cancel(jobId);
@@ -298,9 +321,9 @@ test("stale targeted scans retain in-flight and pending paths", () => {
     });
 
     assert.deepEqual(dbOps.getJSONSetting("pendingLibraryScanJob").changedPaths, [
-      "/data/music/in-flight.flac",
-      "/data/music/pending.flac",
-      "/data/music/new.flac",
+      path.resolve("/data/music/in-flight.flac"),
+      path.resolve("/data/music/pending.flac"),
+      path.resolve("/data/music/new.flac"),
     ]);
   } finally {
     if (staleJobId) queue.cancel(staleJobId);
@@ -321,6 +344,79 @@ test("claiming an unregistered scan does not inherit stale Lidarr mode", () => {
       jobId,
       includeLidarr: false,
     });
+  } finally {
+    if (jobId) queue.cancel(jobId);
+    clearScheduledLibraryScan();
+  }
+});
+
+test("an early replacement claim retains in-flight, pending, and new scan paths", (t) => {
+  const queue = getLibraryScanQueue();
+  clearScheduledLibraryScan();
+  let staleJobId;
+  let replacementJobId;
+  try {
+    staleJobId = scheduleLibraryScan({ includeLidarr: true, changedPaths: ["/data/music/old.flac"] });
+    queue.cancel(staleJobId);
+    dbOps.setJSONSetting("pendingLibraryScanJob", {
+      jobId: staleJobId,
+      includeLidarr: true,
+      changedPaths: ["/data/music/pending.flac"],
+      inFlightActive: true,
+      inFlightPaths: ["/data/music/in-flight.flac"],
+    });
+
+    const enqueue = queue.enqueue.bind(queue);
+    t.mock.method(queue, "enqueue", (payload, options) => {
+      const id = enqueue(payload, options);
+      const claimed = queue.claimOne("early-replacement-library-scan-test");
+      assert.equal(claimed?.id, id);
+      assert.equal(claimScheduledLibraryScanJob(id, claimed.payload), true);
+      const begun = beginLibraryScanJob(id, claimed.payload);
+      assert.equal(begun.includeLidarr, true);
+      assert.deepEqual(begun.changedPaths, [
+        path.resolve("/data/music/in-flight.flac"),
+        path.resolve("/data/music/pending.flac"),
+        path.resolve("/data/music/new.flac"),
+      ]);
+      return id;
+    });
+
+    replacementJobId = scheduleLibraryScan({
+      includeLidarr: false,
+      changedPaths: ["/data/music/new.flac"],
+    });
+    assert.equal(getScheduledLibraryScanJobId(), replacementJobId);
+    assert.equal(queue.getJob(replacementJobId)?.state, "processing");
+  } finally {
+    if (staleJobId) queue.cancel(staleJobId);
+    if (replacementJobId) queue.cancel(replacementJobId);
+    clearScheduledLibraryScan();
+  }
+});
+
+test("an early first claim uses its targeted payload without stale Lidarr mode", (t) => {
+  const queue = getLibraryScanQueue();
+  clearScheduledLibraryScan();
+  dbOps.setJSONSetting("pendingLibraryScanJob", { includeLidarr: true });
+  let jobId;
+  try {
+    const enqueue = queue.enqueue.bind(queue);
+    t.mock.method(queue, "enqueue", (payload, options) => {
+      const id = enqueue(payload, options);
+      const claimed = queue.claimOne("early-first-library-scan-test");
+      assert.equal(claimed?.id, id);
+      assert.equal(claimScheduledLibraryScanJob(id, claimed.payload), true);
+      const begun = beginLibraryScanJob(id, claimed.payload);
+      assert.equal(begun.includeLidarr, false);
+      assert.deepEqual(begun.changedPaths, [path.resolve("/data/music/new.flac")]);
+      return id;
+    });
+    jobId = scheduleLibraryScan({
+      includeLidarr: false,
+      changedPaths: ["/data/music/new.flac"],
+    });
+    assert.equal(getScheduledLibraryScanJobId(), jobId);
   } finally {
     if (jobId) queue.cancel(jobId);
     clearScheduledLibraryScan();

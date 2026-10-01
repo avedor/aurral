@@ -9,11 +9,13 @@ import { useAuth } from "../contexts/AuthContext";
 import { Crosshair, Music } from "lucide-react";
 import { DotLoader } from "../components/DotLoader";
 
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { useDiscoverData } from "./useDiscoverData";
 import { useDiscoverNavigation } from "../hooks/useDiscoverNavigation";
 import { DiscoverPlaylistContextMenu } from "../components/DiscoverPlaylistContextMenu";
 import DiscoveryStatusPill from "../components/DiscoveryStatusPill";
+import Tooltip from "../components/Tooltip";
+import { flowPath, playlistPath } from "../navigation/playlistPaths";
 const DISCOVER_FLOW_PRESET_ORDER = [
   "discover-weekly",
   "trending-mix",
@@ -82,7 +84,7 @@ export default function DiscoverPlaylistsPage() {
   const handleAdoptFlow = useCallback(
     async (playlist) => {
       if (playlist.adoptedFlowId) {
-        navigate(`/playlists?selected=${encodeURIComponent(playlist.adoptedFlowId)}`);
+        navigate(flowPath(playlist.adoptedFlowId));
         return;
       }
       setAdoptingFlowId(playlist.presetId);
@@ -95,7 +97,7 @@ export default function DiscoverPlaylistsPage() {
             : `Added ${playlist.name} as a rotating flow`,
         );
         if (flowId) {
-          navigate(`/playlists?selected=${encodeURIComponent(flowId)}`);
+          navigate(flowPath(flowId));
         }
       } catch (err) {
         showError(
@@ -114,7 +116,7 @@ export default function DiscoverPlaylistsPage() {
   const handleAdoptPlaylist = useCallback(
     async (playlist) => {
       if (playlist.adoptedPlaylistId) {
-        navigate(`/playlists?selected=${encodeURIComponent(playlist.adoptedPlaylistId)}`);
+        navigate(playlistPath(playlist.adoptedPlaylistId));
         return;
       }
       setAdoptingPlaylistId(playlist.presetId);
@@ -127,7 +129,7 @@ export default function DiscoverPlaylistsPage() {
             : `Added ${playlist.name} as a static playlist`,
         );
         if (playlistId) {
-          navigate(`/playlists?selected=${encodeURIComponent(playlistId)}`);
+          navigate(playlistPath(playlistId));
         }
       } catch (err) {
         showError(
@@ -221,7 +223,6 @@ export default function DiscoverPlaylistsPage() {
             playlistsUpdateMessage={playlistsUpdateMessage}
           />
         </div>
-        <p className="page-subtitle">{visiblePlaylists.length} playlists</p>
       </header>
 
       <div className="artist-albums-grid">
@@ -272,15 +273,17 @@ export default function DiscoverPlaylistsPage() {
                 )}
               </button>
 
-              <h2 className="discover-playlists-page__card-title" title={playlist.name}>
-                <button
-                  type="button"
-                  className="discover-playlists-page__title-link"
-                  onClick={() => navigate(`/discover/playlists/${encodeURIComponent(playlist.presetId)}`)}
-                >
-                  {playlist.name}
-                </button>
-              </h2>
+              <Tooltip content={playlist.name}>
+                <h2 className="discover-playlists-page__card-title" >
+                  <button
+                    type="button"
+                    className="discover-playlists-page__title-link"
+                    onClick={() => navigate(`/discover/playlists/${encodeURIComponent(playlist.presetId)}`)}
+                  >
+                    {playlist.name}
+                  </button>
+                </h2>
+              </Tooltip>
 
               <div className="artist-release-card__meta-row">
                 <div className="artist-release-card__meta-col">

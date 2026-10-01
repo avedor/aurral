@@ -10,12 +10,17 @@ const repoRoot = join(__dirname, "..", "..");
 
 const RESET_TABLES = [
   "sessions",
+  "user_identities",
   "lastfm_link_states",
   "subsonic_stars",
+  "play_album_stats",
   "play_events",
   "honker_task_runs",
   "slskd_transfer_history",
   "playlist_download_jobs",
+  "weekly_flow_download_job_cancellations",
+  "weekly_flow_download_cancellations",
+  "weekly_flow_download_provider_work",
   "inbox_items",
   "users",
   "discovery_cache",
@@ -71,6 +76,10 @@ export async function cleanupIsolatedState(paths) {
   try {
     const honkerDb = await importFromRepo("backend/services/honkerDb.js");
     honkerDb.closeHonkerDb();
+  } catch {}
+  try {
+    const { db } = await importFromRepo("backend/config/db-sqlite.js");
+    if (db.open) db.close();
   } catch {}
   await rm(paths.baseDir, { recursive: true, force: true });
 }
@@ -154,10 +163,11 @@ export async function startServerProcess({
   port,
   extraEnv = {},
 } = {}) {
+  // Keep automatic ports above Fetch's highest blocked port (10080).
   const chosenPort =
     Number.isInteger(port) && port > 0
       ? port
-      : 4100 + Math.floor(Math.random() * 1000);
+      : 11000 + Math.floor(Math.random() * 1000);
   const child = spawn("node", ["backend/server.js"], {
     cwd: repoRoot,
     env: {

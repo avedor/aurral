@@ -2,8 +2,9 @@ import { useCallback, useState } from "react";
 import { Music } from "lucide-react";
 import SearchLibraryCheck from "./SearchLibraryCheck";
 import AddActionButton from "./AddActionButton";
-import { getAlbumAddButtonLabel, isAlbumCompleteInLibrary } from "../utils/albumAddAction";
+import { getAlbumAddAction, isAlbumCompleteInLibrary } from "../utils/albumAddAction";
 import { getReleaseNavigationTarget } from "../utils/searchNavigation";
+import Tooltip from "./Tooltip";
 
 function isAlbumActionDisabled(album, isPending, canAddAlbum) {
   if (!canAddAlbum) return true;
@@ -39,21 +40,18 @@ function AlbumCover({ src, alt }) {
   );
 }
 
-function AlbumAction({ album, isPending, canAddAlbum, onAlbumAction }) {
+function AlbumAction({ album, isPending, canAddAlbum, onAlbumAction, libraryDestination }) {
   const actionDisabled = isAlbumActionDisabled(album, isPending, canAddAlbum);
   const isComplete = isAlbumCompleteInLibrary({ status: album.status });
-  const actionLabel = getAlbumAddButtonLabel({
-    status: album.status,
-    inLibrary: album.inLibrary,
-    monitored: album.monitored,
-  });
 
   if (isComplete) {
     return (
-      <span className="artist-release-card__status" title="In library">
-        <SearchLibraryCheck size="overlay" />
-        <span className="sr-only">In library</span>
-      </span>
+      <Tooltip content="In library">
+        <span className="artist-release-card__status" >
+          <SearchLibraryCheck size="overlay" />
+          <span className="sr-only">In library</span>
+        </span>
+      </Tooltip>
     );
   }
 
@@ -61,13 +59,11 @@ function AlbumAction({ album, isPending, canAddAlbum, onAlbumAction }) {
 
   return (
     <AddActionButton
-      onClick={(event) => {
-        event.stopPropagation();
-        onAlbumAction(album);
-      }}
+      {...getAlbumAddAction(album, libraryDestination)}
+      ownerConflict={album.ownerConflict}
+      onAdd={(managedBy) => onAlbumAction(album, managedBy)}
       isLoading={isPending}
       disabled={actionDisabled}
-      label={actionLabel}
     />
   );
 }
@@ -78,6 +74,7 @@ function SearchAlbumResults({
   canAddAlbum,
   pendingAlbumIds,
   onAlbumAction,
+  libraryDestination,
   navigate,
   viewMode = "grid",
 }) {
@@ -166,6 +163,7 @@ function SearchAlbumResults({
               isPending={isPending}
               canAddAlbum={canAddAlbum}
               onAlbumAction={onAlbumAction}
+              libraryDestination={libraryDestination}
             />
           </div>
         </article>
@@ -198,18 +196,21 @@ function SearchAlbumResults({
               isPending={isPending}
               canAddAlbum={canAddAlbum}
               onAlbumAction={onAlbumAction}
+              libraryDestination={libraryDestination}
             />
           </div>
         </div>
-        <h2 className="artist-release-card__title artist-truncate" title={album.title}>
-          <button
-            type="button"
-            className="search-album-results__title-link"
-            onClick={() => openAlbum(album)}
-          >
-            {album.title}
-          </button>
-        </h2>
+        <Tooltip content={album.title}>
+          <h2 className="artist-release-card__title artist-truncate" >
+            <button
+              type="button"
+              className="search-album-results__title-link"
+              onClick={() => openAlbum(album)}
+            >
+              {album.title}
+            </button>
+          </h2>
+        </Tooltip>
         {album.artistName ? (
           <button
             type="button"

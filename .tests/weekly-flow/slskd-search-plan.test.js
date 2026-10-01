@@ -30,6 +30,10 @@ test("buildSlskdSearchTierGroups uses a short album-first search plan", () => {
         tier.queries.includes("*rom *utumn *o *shes The Fiction We Live"),
     ),
   );
+  const wildcardAlbumIndex = tiers.findIndex((tier) => tier.name === "wildcard_album");
+  const albumOnlyIndex = tiers.findIndex((tier) => tier.name === "album_only");
+  assert.deepEqual(tiers[albumOnlyIndex]?.queries, ["The Fiction We Live"]);
+  assert.ok(wildcardAlbumIndex < albumOnlyIndex);
   assert.ok(
     tiers.some(
       (tier) =>
@@ -37,6 +41,7 @@ test("buildSlskdSearchTierGroups uses a short album-first search plan", () => {
         tier.queries.includes("The Fiction We Live The After Dinner Payback"),
     ),
   );
+  assert.ok(albumOnlyIndex < tiers.findIndex((tier) => tier.name === "album_track"));
 });
 
 test("hasSlskdSearchCandidates is false when no results are valid candidates", () => {
@@ -85,4 +90,18 @@ test("hasSlskdSearchCandidates waits for a small floor of valid candidates", () 
     }),
     true,
   );
+});
+
+test("Soulseek early exit ignores denied files and blacklisted peers", () => {
+  const results = Array.from({ length: 3 }, (_, index) => ({
+    user: `peer-${index}`, file: "music/From Autumn to Ashes/The Fiction We Live/01 The After Dinner Payback.flac",
+    slots: 1, speed: 700000,
+  }));
+  const options = { deniedSourceKeys: new Set(results.map((entry) => `${entry.user}\0${entry.file}`.toLowerCase())) };
+  assert.equal(hasSlskdSearchCandidates(results, fataTrack, options), false);
+  assert.equal(hasSlskdSearchCandidates(results, fataTrack, {
+    isUserBlacklisted: () => true,
+  }), false);
+  const permitted = results.map((entry) => ({ ...entry, user: `allowed-${entry.user}` }));
+  assert.equal(hasSlskdSearchCandidates([...results, ...permitted], fataTrack, options), true);
 });

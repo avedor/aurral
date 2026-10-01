@@ -11,6 +11,8 @@ import {
 const [
   isolatedState,
   { prowlarrClient },
+  { downloadTracker },
+  { processUsenetPipelinePayload },
   { nzbgetClient },
   { SabnzbdClient },
   { getEnabledDownloadSources },
@@ -20,6 +22,8 @@ const [
 ] = await setupIsolatedBackend(
   "usenet-integration",
   "backend/services/prowlarrClient.js",
+  "backend/services/weeklyFlow/weeklyFlowDownloadTracker.js",
+  "backend/services/usenetOrchestrator.js",
   "backend/services/nzbgetClient.js",
   "backend/services/sabnzbdClient.js",
   "backend/services/downloadSourceService.js",
@@ -152,6 +156,80 @@ test("Prowlarr client lists enabled Usenet indexers and searches audio releases"
   }
 });
 
+test("Usenet flow search tries the album-only query after artist-album queries", async () => {
+  const queries = [];
+  const server = await createMockHttpServer((req, res) => {
+    const url = new URL(req.url, "http://mock");
+    if (url.pathname === "/api/v1/indexer") {
+      sendJson(res, 200, [
+        {
+          id: 1,
+          name: "Music One",
+          enable: true,
+          protocol: "usenet",
+          supportsSearch: true,
+          priority: 5,
+          capabilities: { categories: [{ id: 3010 }] },
+        },
+      ]);
+      return;
+    }
+    if (url.pathname === "/api/v1/search") {
+      queries.push(url.searchParams.get("query"));
+      sendJson(res, 200, []);
+      return;
+    }
+    sendJson(res, 404, {});
+  });
+
+  try {
+    dbOps.updateSettings({
+      integrations: {
+        prowlarr: {
+          enabled: true,
+          url: server.url,
+          apiKey: "prowlarr-key",
+          categories: [3000],
+        },
+      },
+    });
+    const jobId = downloadTracker.addJob(
+      {
+        artistName: "Rihanna",
+        trackName: "Umbrella",
+        albumName: "Good Girl Gone Bad",
+        releaseYear: "2007",
+        durationMs: 250000,
+      },
+      "usenet-album-only-fallback",
+    );
+
+    const result = await processUsenetPipelinePayload(
+      { phase: "search", source: "usenet", jobId },
+      {
+        failOrTryNextSource: (_payload, _job, message, details) => ({ message, details }),
+      },
+    );
+
+    const albumOnlyIndex = queries.indexOf("Good Girl Gone Bad");
+    const albumTrackIndex = queries.indexOf("Good Girl Gone Bad Umbrella");
+    assert.ok(albumOnlyIndex > 0);
+    assert.ok(albumTrackIndex > albumOnlyIndex);
+    assert.ok(
+      [
+        "Rihanna Good Girl Gone Bad 2007",
+        "Rihanna Good Girl Gone Bad",
+        "*ihanna Good Girl Gone Bad 2007",
+        "*ihanna Good Girl Gone Bad",
+      ].every((query) => queries.indexOf(query) >= 0 && queries.indexOf(query) < albumOnlyIndex),
+    );
+    assert.equal(result.message, "No suitable Usenet search results");
+    assert.equal(result.details.queryCount, queries.length);
+  } finally {
+    await server.close();
+  }
+});
+
 test("NZBGet client uses JSON-RPC append signature and exposes completed paths", async () => {
   const calls = [];
   const server = await createMockHttpServer((req, res) => {
@@ -236,6 +314,36 @@ test("SABnzbd client reads the completed download folder", async () => {
   );
 });
 
+test("SABnzbd client removes queued and historical jobs", async () => {
+  const calls = [];
+  const client = new SabnzbdClient();
+  client.api = async (mode, params) => {
+    calls.push({ mode, params });
+    return { status: true };
+  };
+
+  assert.equal(await client.deleteQueueItem("SABnzbd_nzo_queue"), true);
+  assert.equal(await client.deleteHistoryItem("SABnzbd_nzo_history"), true);
+  assert.deepEqual(calls, [
+    {
+      mode: "queue",
+      params: { name: "delete", value: "SABnzbd_nzo_queue", del_files: 1 },
+    },
+    {
+      mode: "history",
+      params: { name: "delete", value: "SABnzbd_nzo_history", del_files: 1 },
+    },
+  ]);
+});
+
+test("SABnzbd client does not claim a failed queue or history deletion succeeded", async () => {
+  const client = new SabnzbdClient();
+  client.api = async () => ({ status: false });
+
+  assert.equal(await client.deleteQueueItem("SABnzbd_nzo_queue"), false);
+  assert.equal(await client.deleteHistoryItem("SABnzbd_nzo_history"), false);
+});
+
 test("download source selection orders enabled sources by priority", () => {
   dbOps.updateSettings({
     integrations: {
@@ -303,3 +411,33 @@ test("Usenet matcher prefers matching audio releases and keeps fallback candidat
   const selected = selectRankedUsenetCandidates(ranked, 2);
   assert.equal(selected.length, 2);
 });
+
+for (const albumGrab of [false, true]) {
+  test(`Usenet continues past ${albumGrab ? "track-only album-grab" : "denied"} results`, async () => {
+    const jobId = downloadTracker.addJob({ artistName: "The Band", trackName: "First",
+      albumName: "Album", durationMs: 180000 }, "usenet-exclusions");
+    if (!albumGrab) {
+      for (const id of ["first-1", "first-2"]) downloadTracker.recordDeniedSource(jobId, "usenet", id);
+    }
+    const originalDenials = structuredClone(downloadTracker.getJob(jobId).deniedRemoteSources);
+    const original = prowlarrClient.search;
+    let searches = 0;
+    prowlarrClient.search = async () => {
+      const first = ++searches === 1;
+      return [1, 2].map((index) => ({ guid: `${first ? "first" : "allowed"}-${index}`,
+        title: `The Band - ${first ? "First" : "Album"} FLAC`, protocol: "usenet",
+        downloadUrl: `https://release.invalid/${first}/${index}`, indexerId: index, size: 100000000 }));
+    };
+    try {
+      const result = await processUsenetPipelinePayload({ phase: "search", source: "usenet", jobId, albumGrab }, {
+        failOrTryNextSource: (_payload, _job, reason) => ({ error: reason }),
+      });
+      assert.equal(result.phase, "download");
+      assert.deepEqual(result.candidates.map((entry) => entry.raw.guid), ["allowed-1", "allowed-2"]);
+      assert.deepEqual(downloadTracker.getJob(jobId).deniedRemoteSources,
+        originalDenials);
+    } finally {
+      prowlarrClient.search = original;
+    }
+  });
+}

@@ -158,6 +158,10 @@ class WebSocketService {
   }
 
   broadcast(channel, data) {
+    if (process.env.AURRAL_BACKGROUND_WORKER_GROUP && process.connected && process.send) {
+      process.send({ type: 'websocket-broadcast', channel, data });
+      return 0;
+    }
     const message = JSON.stringify({
       channel,
       timestamp: Date.now(),
@@ -214,6 +218,23 @@ class WebSocketService {
         client.ws.close(4401, "Unauthorized");
       } catch {}
     }
+  }
+
+  disconnectUser(userId) {
+    const targetUserId = Number(userId);
+    if (!Number.isFinite(targetUserId)) return 0;
+    let disconnected = 0;
+    for (const client of [...this.clients]) {
+      if (Number(client.user?.id) !== targetUserId) continue;
+      this.clients.delete(client);
+      client.subscriptions.clear();
+      client.user = null;
+      try {
+        client.ws.close(4403, "Account inactive");
+      } catch {}
+      disconnected++;
+    }
+    return disconnected;
   }
 
   emitDiscoveryUpdate(data) {

@@ -10,8 +10,10 @@ import {
   getCanonicalLibrary,
   getCanonicalLibraryForAlbumReferences,
   getCanonicalLibraryForArtistReferences,
+  getCanonicalLibraryForTrackMatches,
   getCanonicalSearchPage,
   getCanonicalTopTracks,
+  getCanonicalLibraryLastModified,
   getCanonicalTrack,
   getCanonicalTrackPage,
 } from "./libraryQueryService.js";
@@ -30,6 +32,15 @@ import { weeklyFlowWorker } from "./weeklyFlow/weeklyFlowWorker.js";
 import { hasPermission } from "../middleware/auth.js";
 import { recordTrackJobQueued } from "./aurralHistoryService.js";
 import { selectCanonicalFile } from "./canonicalFileSelector.js";
+import { logger } from "./logger.js";
+import { withHonkerLock } from "./honkerDb.js";
+import { removePlaylistFileIfUnshared } from "./weeklyFlow/weeklyFlowFileReuse.js";
+import {
+  isDownloadJobCancelled,
+  restoreDownloadJobCancellations,
+} from "./weeklyFlow/weeklyFlowDownloadCancellation.js";
+import { processWeeklyFlowOperation } from "./weeklyFlow/weeklyFlowOperations.js";
+import { cancelDownloadWorkForJobs } from "./weeklyFlow/weeklyFlowDownloadCancellationService.js";
 
 const idFor = (kind, key) =>
   `${kind}:${encodeURIComponent(String(key)).replaceAll("%3A", ":")}`;
@@ -53,7 +64,7 @@ const seconds = (durationMs) => {
   return Number.isFinite(value) && value > 0 ? Math.round(value / 1000) : 0;
 };
 
-const PROTOCOL_DATE = "1970-01-01T00:00:00.000Z";
+const isoDate = (epochMs) => new Date(Number(epochMs) || Date.now()).toISOString();
 
 const year = (value) => {
   const match = /^(\d{4})/.exec(String(value || ""));
@@ -68,6 +79,11 @@ const normalizeLimit = (value, fallback = 20) => {
 const normalizeOffset = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? Math.max(parsed, 0) : 0;
+};
+
+const includesAurralMusicFolder = (options = {}) => {
+  const musicFolderId = String(options.musicFolderId || "").trim();
+  return !musicFolderId || musicFolderId === "1";
 };
 
 const genreNames = (value) =>
@@ -101,6 +117,7 @@ const findArtistForAlbum = (library, album) =>
 const protocolArtist = (artist, fallback = "Unknown Artist") => ({
   id: idFor("artist", artist?.identityKey || `name:artist:${fallback.toLocaleLowerCase()}`),
   name: artist?.name || fallback,
+  musicBrainzId: artist?.mbid || "",
 });
 
 const albumTracks = (library, album) =>
@@ -139,7 +156,7 @@ const toSong = (library, track, album = findAlbumForTrack(library, track)) => {
     albumArtists: [artistValue],
     artists: [artistValue],
     contentType: `audio/${format}`,
-    created: PROTOCOL_DATE,
+    created: isoDate(track.createdAt ?? file?.createdAt ?? file?.mtimeMs),
     track: Number(relation?.trackNumber) || 0,
     discNumber: Number(relation?.discNumber) || 1,
     coverArt: album ? coverArtForAlbum(album) : undefined,
@@ -148,6 +165,9 @@ const toSong = (library, track, album = findAlbumForTrack(library, track)) => {
     suffix: format,
     path: idFor("song", track.identityKey),
     type: "music",
+    starred: library.starredAt?.get(`song:${track.identityKey}`),
+    musicBrainzId: track.mbid || "",
+    mediaType: "song",
   };
   const releaseYear = year(album?.releaseDate);
   if (releaseYear != null) song.year = releaseYear;
@@ -179,7 +199,7 @@ const albumData = (library, album) => {
     parent: artistValue.id,
     isDir: true,
     isVideo: false,
-    created: PROTOCOL_DATE,
+    created: isoDate(album.createdAt),
     coverArt: coverArtForAlbum(album),
     songCount: tracks.length,
     duration: tracks.reduce(
@@ -187,6 +207,11 @@ const albumData = (library, album) => {
       0,
     ),
     song: [],
+    starred: library.starredAt?.get(`album:${album.identityKey}`),
+    // OpenSubsonic wants the release MBID here; Lidarr-indexed albums only know the
+    // release-group id, so they report an empty value rather than a wrong one.
+    musicBrainzId: album.mbid || "",
+    mediaType: "album",
   };
   const releaseYear = year(album.releaseDate);
   if (releaseYear != null) value.year = releaseYear;
@@ -216,6 +241,9 @@ const toArtist = (library, artist) => {
     coverArt: idFor("artist", artist.identityKey),
     albumCount: albums.length,
     album: albums.map((album) => toAlbumSummary(library, album)),
+    starred: library.starredAt?.get(`artist:${artist.identityKey}`),
+    musicBrainzId: artist.mbid || "",
+    mediaType: "artist",
   };
   if (genres.length) {
     value.genre = genres[0];
@@ -224,21 +252,25 @@ const toArtist = (library, artist) => {
   return value;
 };
 
-const toArtistSummary = (artist) => {
+const toArtistSummary = (artist, library = {}) => {
   const genres = entityGenres(artist);
   return {
     id: idFor("artist", artist.identityKey),
     name: artist.name,
     coverArt: idFor("artist", artist.identityKey),
     albumCount: artist.albumCount ?? artist.albumIds.length,
+    starred: library.starredAt?.get(`artist:${artist.identityKey}`),
+    musicBrainzId: artist.mbid || "",
+    mediaType: "artist",
     ...(genres.length
       ? { genre: genres[0], genres: genres.map((name) => ({ name })) }
       : {}),
   };
 };
 
-const indexFocusedLibrary = (library) => ({
+const indexFocusedLibrary = (library, starredAt = library.starredAt) => ({
   ...library,
+  starredAt,
   artistsById: new Map(library.artists.map((artist) => [artist.id, artist])),
   albumsById: new Map(library.albums.map((album) => [album.id, album])),
   tracksById: new Map(library.tracks.map((track) => [track.id, track])),
@@ -268,10 +300,23 @@ function playlistFromId(user, value) {
   return flowPlaylistConfig.getSharedPlaylistForUser(user, parsed.key);
 }
 
-function toPlaylistSong(playlist, kind, job) {
+function toPlaylistSong(
+  playlist,
+  kind,
+  job,
+  starredAt = null,
+  owned = findAvailableCanonicalFile(trackFromJob(job)),
+) {
+  if (owned) {
+    return {
+      ...toSong(indexFocusedLibrary(owned.library, starredAt), owned.track),
+      parent: idFor(kind, playlist.id),
+    };
+  }
   const artist = protocolArtist(null, job.artistName || "Unknown Artist");
   const format = String(job.finalPath || "").split(".").pop()?.toLowerCase() || "mp3";
-  const id = idFor(kind === "flow" ? "flow-song" : "shared-song", `${playlist.id}:${job.id}`);
+  const songKind = kind === "flow" ? "flow-song" : "shared-song";
+  const id = idFor(songKind, `${playlist.id}:${job.id}`);
   const albumMbid = String(job.releaseGroupMbid || job.albumMbid || "").trim();
   return {
     id,
@@ -286,7 +331,9 @@ function toPlaylistSong(playlist, kind, job) {
     artists: [artist],
     coverArt: albumMbid ? idFor("album", `release-group:${albumMbid}`) : undefined,
     contentType: `audio/${format}`,
-    created: PROTOCOL_DATE,
+    created: isoDate(job.createdAt),
+    // Stars on unmatched playlist songs stay keyed by the playlist song, not a canonical track.
+    starred: starredAt?.get(`${songKind}:${playlist.id}:${job.id}`),
     track: job.trackNumber || 0,
     discNumber: job.discNumber || 1,
     duration: seconds(job.durationMs),
@@ -294,6 +341,8 @@ function toPlaylistSong(playlist, kind, job) {
     suffix: format,
     path: id,
     type: "music",
+    musicBrainzId: job.trackMbid || "",
+    mediaType: "song",
   };
 }
 
@@ -338,56 +387,73 @@ const flowJobs = (flow, { includePending = false } = {}) =>
 
 const playlistCoverArt = (kind, playlistId) => idFor(kind, playlistId);
 
-export function listArtists() {
-  return getCanonicalArtistPage({ source: "all", availableOnly: false }).artists.map(toArtistSummary);
+// Stars are per-user library state, so a star change has to move the timestamp too or clients
+// keep the starred values they cached before it.
+export function getLibraryLastModified(user) {
+  const stars = user?.id ? Number(getStarsChangedStmt.get(user.id)?.changed_at) || 0 : 0;
+  return Math.max(getCanonicalLibraryLastModified() ?? 0, stars);
 }
 
-export function getArtist(value) {
+export function listArtists(user) {
+  const library = { starredAt: starredAtFor(user) };
+  return getCanonicalArtistPage({ source: "all", availableOnly: true }).artists.map(
+    (artist) => toArtistSummary(artist, library),
+  );
+}
+
+export function getArtist(value, user) {
   const parsed = parseId(value);
   if (parsed?.kind !== "artist") return null;
   const library = indexFocusedLibrary(getCanonicalLibraryForArtistReferences({
     source: "all",
-    availableOnly: false,
+    availableOnly: true,
     references: [parsed.key],
-  }));
+  }), starredAtFor(user));
   const artist = findCanonical(library, parsed);
   return artist?.identityKey ? toArtist(library, artist) : null;
 }
 
-export function getAlbum(value) {
+export function getAlbum(value, user) {
   const parsed = parseId(value);
   if (parsed?.kind !== "album") return null;
   const library = indexFocusedLibrary(getCanonicalLibraryForAlbumReferences({
     source: "all",
-    availableOnly: false,
+    availableOnly: true,
     references: [parsed.key],
-  }));
+  }), starredAtFor(user));
   const album = findCanonical(library, parsed);
   return album?.identityKey ? toAlbum(library, album) : null;
 }
 
 export function getSong(value, user) {
   const playlistEntry = playlistJobFromId(user, value);
-  if (playlistEntry) return toPlaylistSong(playlistEntry.playlist, playlistEntry.kind, playlistEntry.job);
+  if (playlistEntry) {
+    return toPlaylistSong(
+      playlistEntry.playlist,
+      playlistEntry.kind,
+      playlistEntry.job,
+      starredAtFor(user),
+    );
+  }
 
   const parsed = parseId(value);
   if (parsed?.kind !== "song") return null;
   const library = indexFocusedLibrary(getCanonicalTrack({
     trackId: parsed.key,
     source: "all",
-    availableOnly: false,
-  }));
+    availableOnly: true,
+  }), starredAtFor(user));
   const track = findCanonical(library, parsed);
   return track?.identityKey ? toSong(library, track) : null;
 }
 
-export function getMusicDirectory(value) {
+export function getMusicDirectory(value, user) {
   if (value === "root" || value === "1") {
     const rootId = value === "1" ? "1" : "root";
     return {
       id: rootId,
       name: "Aurral",
-      child: listArtists().map((artist) => ({
+      child: listArtists(user).map((artist) => ({
         id: artist.id,
         parent: rootId,
         isDir: true,
@@ -398,21 +464,22 @@ export function getMusicDirectory(value) {
   }
   const parsed = parseId(value);
   if (parsed?.kind === "artist") {
-    const artist = getArtist(value);
+    const artist = getArtist(value, user);
     return artist ? { id: artist.id, name: artist.name, child: artist.album || [] } : null;
   }
   if (parsed?.kind === "album") {
-    const album = getAlbum(value);
+    const album = getAlbum(value, user);
     return album ? { id: album.id, name: album.name, child: album.song || [] } : null;
   }
   return null;
 }
 
-export function searchLibrary(query, options = {}) {
+export function searchLibrary(query, options = {}, user = null) {
+  if (!includesAurralMusicFolder(options)) return { artist: [], album: [], song: [] };
   const needle = String(query || "").trim().toLocaleLowerCase();
   const result = getCanonicalSearchPage({
     source: "all",
-    availableOnly: false,
+    availableOnly: true,
     query: needle,
     artistLimit: normalizeLimit(options.artistCount),
     artistOffset: normalizeOffset(options.artistOffset),
@@ -421,58 +488,136 @@ export function searchLibrary(query, options = {}) {
     songLimit: normalizeLimit(options.songCount),
     songOffset: normalizeOffset(options.songOffset),
   });
-  const artistLibrary = indexFocusedLibrary({ artists: result.artists, albums: [], tracks: [] });
-  const albumLibrary = indexFocusedLibrary(result.albums);
-  const trackLibrary = indexFocusedLibrary(result.tracks);
+  const starredAt = starredAtFor(user);
+  const artistLibrary = indexFocusedLibrary({ artists: result.artists, albums: [], tracks: [] }, starredAt);
+  const albumLibrary = indexFocusedLibrary(result.albums, starredAt);
+  const trackLibrary = indexFocusedLibrary(result.tracks, starredAt);
   return {
-    artist: artistLibrary.artists.map(toArtistSummary),
+    artist: artistLibrary.artists.map((artist) => toArtistSummary(artist, artistLibrary)),
     album: albumLibrary.albums.map((album) => toAlbum(albumLibrary, album)),
     song: trackLibrary.tracks.map((track) => toSong(trackLibrary, track)),
   };
 }
 
-export function getAlbumList(options = {}) {
+export function getRandomSongs(options = {}, user = null) {
+  if (!includesAurralMusicFolder(options)) return [];
+  const library = indexFocusedLibrary(getCanonicalTrackPage({
+    source: "all",
+    availableOnly: true,
+    genre: options.genre,
+    fromYear: options.fromYear,
+    toYear: options.toYear,
+    limit: normalizeLimit(options.size, 10),
+    random: true,
+  }), starredAtFor(user));
+  return library.tracks.map((track) => toSong(library, track));
+}
+
+export function getAlbumList(options = {}, user = null) {
+  if (!includesAurralMusicFolder(options)) return [];
   const type = String(options.type || "alphabeticalByName");
-  if (type === "starred") return [];
+  const offset = normalizeOffset(options.offset);
+  const limit = normalizeLimit(options.size);
+  if (type === "starred") {
+    return getStarred(user).album.slice(offset, offset + limit);
+  }
+  if (type === "frequent") return getFrequentlyPlayedAlbums(user, { offset, limit });
+  // Aurral does not currently store per-user ratings. Returning no albums is
+  // accurate; falling through would falsely label an alphabetical list as rated.
+  if (type === "highest") return [];
   const library = indexFocusedLibrary(getCanonicalAlbumPage({
     source: "all",
-    availableOnly: false,
+    availableOnly: true,
     type,
     genre: options.genre,
     fromYear: options.fromYear,
     toYear: options.toYear,
-    offset: normalizeOffset(options.offset),
-    limit: normalizeLimit(options.size),
-  }));
+    offset,
+    limit,
+  }), starredAtFor(user));
   return library.albums.map((album) => toAlbumSummary(library, album));
 }
 
-export function getSongsByGenre(genre, options = {}) {
+export function getSongsByGenre(genre, options = {}, user = null) {
+  if (!includesAurralMusicFolder(options)) return [];
   const target = String(genre || "").trim().toLocaleLowerCase();
   if (!target) return [];
   const library = indexFocusedLibrary(getCanonicalTrackPage({
     source: "all",
-    availableOnly: false,
+    availableOnly: true,
     genre: target,
     offset: normalizeOffset(options.offset),
     limit: normalizeLimit(options.count),
-  }));
+  }), starredAtFor(user));
   return library.tracks.map((track) => toSong(library, track));
 }
 
 export function getGenres() {
-  return getCanonicalGenres({ source: "all", availableOnly: false });
+  return getCanonicalGenres({ source: "all", availableOnly: true });
 }
 
 const getStarsStmt = db.prepare(
-  "SELECT entity_kind, entity_key FROM subsonic_stars WHERE user_id = ? ORDER BY created_at, entity_kind, entity_key",
+  "SELECT entity_kind, entity_key, created_at FROM subsonic_stars WHERE user_id = ? ORDER BY created_at, entity_kind, entity_key",
 );
+const getFrequentlyPlayedAlbumsStmt = db.prepare(`
+  SELECT album.identity_key
+  FROM play_album_stats AS played
+  JOIN library_albums AS album
+    ON album.identity_key = played.album_key
+  WHERE played.user_id = ?
+    AND EXISTS (
+      SELECT 1
+      FROM library_album_tracks AS album_track
+      JOIN library_media_files AS media
+        ON media.track_id = album_track.track_id
+        AND (media.album_id = album_track.album_id OR media.album_id IS NULL)
+      WHERE album_track.album_id = album.id
+        AND media.available = 1
+    )
+  GROUP BY album.id
+  ORDER BY SUM(played.play_count) DESC,
+    MAX(played.last_played_at) DESC,
+    album.title COLLATE NOCASE,
+    album.id
+  LIMIT ? OFFSET ?
+`);
 const addStarStmt = db.prepare(
   "INSERT OR IGNORE INTO subsonic_stars (user_id, entity_kind, entity_key, created_at) VALUES (?, ?, ?, ?)",
 );
 const removeStarStmt = db.prepare(
   "DELETE FROM subsonic_stars WHERE user_id = ? AND entity_kind = ? AND entity_key = ?",
 );
+const touchStarsStmt = db.prepare(
+  `INSERT INTO subsonic_star_changes (user_id, changed_at) VALUES (?, ?)
+   ON CONFLICT(user_id) DO UPDATE SET changed_at = excluded.changed_at`,
+);
+const getStarsChangedStmt = db.prepare(
+  "SELECT changed_at FROM subsonic_star_changes WHERE user_id = ?",
+);
+
+function getFrequentlyPlayedAlbums(user, { offset, limit }) {
+  if (!user?.id || limit === 0) return [];
+  const albumKeys = getFrequentlyPlayedAlbumsStmt
+    .all(user.id, limit, offset)
+    .map((row) => row.identity_key);
+  if (!albumKeys.length) return [];
+  const library = indexFocusedLibrary(getCanonicalLibrary({
+    availableOnly: true,
+    favoriteKeys: albumKeys.map((key) => ({ kind: "album", key })),
+  }), starredAtFor(user));
+  return albumKeys
+    .map((key) => library.albumsByIdentity.get(key))
+    .filter(Boolean)
+    .map((album) => toAlbumSummary(library, album));
+}
+
+// Clients compare lastModified for equality/greater-than, so a star change must land strictly after
+// both the previous star timestamp and the library timestamp even on a fast clock.
+const touchStars = (userId) => {
+  const previous = Number(getStarsChangedStmt.get(userId)?.changed_at) || 0;
+  const floor = Math.max(previous, getCanonicalLibraryLastModified() ?? 0);
+  touchStarsStmt.run(userId, Math.max(Date.now(), floor + 1));
+};
 
 const isSameTrack = (left, right) => tracksShareMembership(left, right);
 
@@ -559,45 +704,65 @@ const findReusableLibrarySource = (track) =>
       isSameTrack(job, track),
   );
 
-const findAvailableCanonicalFile = (track) => {
-  let library = indexFocusedLibrary(track?.trackMbid
-    ? getCanonicalTrack({
-        trackId: track.trackMbid,
-        source: "all",
-        availableOnly: true,
-      })
-    : getCanonicalTrackPage({
-        source: "all",
-        availableOnly: true,
-        query: track?.trackName,
-        artist: track?.artistName,
-        limit: 25,
-      }));
-  let candidate = library.tracks.find((entry) => isSameTrack(track, trackFromCanonical(library, entry)));
-  if (!candidate && track?.trackMbid) {
-    library = indexFocusedLibrary(getCanonicalTrackPage({
-      source: "all",
-      availableOnly: true,
-      query: track.trackName,
-      artist: track.artistName,
-      limit: 25,
-    }));
-    candidate = library.tracks.find((entry) => isSameTrack(track, trackFromCanonical(library, entry)));
+// Resolve playlist track descriptors to available library tracks. All descriptors of a batch are
+// looked up in one canonical query (by recording MBID and by title), then matched in memory with
+// the same rule the playlist code uses, so a 1000-entry playlist costs a couple of statements.
+export function resolveCanonicalTracks(descriptors) {
+  const items = (Array.isArray(descriptors) ? descriptors : []).map((entry) => normalizeSharedTrack(entry));
+  const present = items.filter(Boolean);
+  if (!present.length) return items.map(() => null);
+  const library = indexFocusedLibrary(getCanonicalLibraryForTrackMatches({
+    source: "all",
+    availableOnly: true,
+    mbids: present.map((track) => track.trackMbid),
+    titles: present.map((track) => track.trackName),
+  }));
+  const byTitle = new Map();
+  const byMbid = new Map();
+  for (const track of library.tracks) {
+    const title = String(track.title || "").trim().toLowerCase();
+    if (!byTitle.has(title)) byTitle.set(title, []);
+    byTitle.get(title).push(track);
+    if (track.mbid && !byMbid.has(track.mbid)) byMbid.set(track.mbid, track);
   }
-  const album = findAlbumForTrack(library, candidate);
-  const file = firstFile(candidate, album?.id, album?.managedBy);
-  return file?.available && file.path
-    ? { file, track: candidate, albumName: album?.title }
-    : null;
-};
+  const resolveFile = (entry) => {
+    const album = findAlbumForTrack(library, entry);
+    return { album, file: firstFile(entry, album?.id, album?.managedBy) };
+  };
+  const playable = (entry) => {
+    const { file } = resolveFile(entry);
+    return Boolean(file?.available && file.path);
+  };
+  return items.map((track) => {
+    if (!track) return null;
+    // A shared recording MBID identifies the track even when the titles differ (remaster, typo).
+    const byId = track.trackMbid ? byMbid.get(track.trackMbid) : null;
+    const candidates = byTitle.get(track.trackName.toLowerCase()) || [];
+    const match = byId && playable(byId)
+      ? byId
+      : candidates.find(
+        (entry) => playable(entry) && isSameTrack(track, trackFromCanonical(library, entry)),
+      );
+    if (!match) return null;
+    const { album, file } = resolveFile(match);
+    return { file, library, track: match, albumName: album?.title };
+  });
+}
 
-const canonicalStarRow = (user, row) => {
-  if (!["flow-song", "shared-song"].includes(row?.entity_kind)) return row;
-  const playlistSong = resolvePlaylistSong(user, idFor(row.entity_kind, row.entity_key));
-  const canonical = playlistSong ? findAvailableCanonicalFile(playlistSong.track)?.track : null;
-  return canonical
-    ? { ...row, entity_kind: "song", entity_key: canonical.identityKey }
-    : row;
+const findAvailableCanonicalFile = (track) => resolveCanonicalTracks([track])[0];
+
+// Map playlist-song star rows to their canonical song row when the entry is a library track.
+const canonicalStarRows = (user, rows) => {
+  const playlistSongs = rows.map((row) =>
+    ["flow-song", "shared-song"].includes(row?.entity_kind)
+      ? resolvePlaylistSong(user, idFor(row.entity_kind, row.entity_key))
+      : null,
+  );
+  const resolved = resolveCanonicalTracks(playlistSongs.map((song) => song?.track || null));
+  return rows.map((row, index) => {
+    const canonical = resolved[index]?.track;
+    return canonical ? { ...row, entity_kind: "song", entity_key: canonical.identityKey } : row;
+  });
 };
 
 const ensureLibraryJob = (track, createdJobIds = null) => {
@@ -607,7 +772,12 @@ const ensureLibraryJob = (track, createdJobIds = null) => {
       downloadTracker.setPending(existing.id, "Requested again", { asRetryCycle: true });
     }
     if (existing.status !== "done") {
-      weeklyFlowWorker.start().catch(() => {});
+      weeklyFlowWorker.start().catch((error) => {
+        logger.error("subsonic", "Could not start download for a playlist track", {
+          jobId: existing.id,
+          reason: error?.message || String(error),
+        });
+      });
     }
     return existing.id;
   }
@@ -631,7 +801,12 @@ const ensureLibraryJob = (track, createdJobIds = null) => {
     return jobId;
   }
   recordTrackJobQueued(downloadTracker.getJob(jobId));
-  weeklyFlowWorker.start().catch(() => {});
+  weeklyFlowWorker.start().catch((error) => {
+    logger.error("subsonic", "Could not start download for a playlist track", {
+      jobId,
+      reason: error?.message || String(error),
+    });
+  });
   return jobId;
 };
 
@@ -640,10 +815,9 @@ const toCanonicalPlaylistTrack = (track, canonicalJobId) => ({
   canonicalJobId: String(canonicalJobId || "").trim() || null,
 });
 
-const removeLegacyPlaylistJobs = (playlistId) => {
-  for (const job of downloadTracker.getByPlaylistType(playlistId)) {
-    downloadTracker.removeJob(job.id);
-  }
+const cancelLegacyPlaylistJobs = async (jobs) => {
+  if (jobs.length === 0) return;
+  await cancelDownloadWorkForJobs(jobs);
 };
 
 const refreshSubsonicPlaylist = (playlistId) => {
@@ -651,7 +825,12 @@ const refreshSubsonicPlaylist = (playlistId) => {
   Promise.all([
     playlistManager.ensureSmartPlaylists(),
     playlistManager.refreshPlaylist(playlistId),
-  ]).catch(() => {});
+  ]).catch((error) => {
+    logger.error("subsonic", "Could not refresh playlist", {
+      playlistId,
+      reason: error?.message || String(error),
+    });
+  });
   playlistManager.scheduleScanLibrary();
 };
 
@@ -677,7 +856,7 @@ const canonicalizePlaylistTracks = (tracks, createdJobIds = null) => {
   return normalized;
 };
 
-const replaceSubsonicPlaylistTracks = (user, playlist, tracks, updates = {}) => {
+const replaceSubsonicPlaylistTracks = async (user, playlist, tracks, updates = {}) => {
   if (!playlist || !flowPlaylistConfig.canUserAccessSharedPlaylist(user, playlist)) return null;
   const createdJobIds = [];
   const canonicalTracks = canonicalizePlaylistTracks(tracks, createdJobIds);
@@ -685,20 +864,80 @@ const replaceSubsonicPlaylistTracks = (user, playlist, tracks, updates = {}) => 
     for (const jobId of createdJobIds) downloadTracker.removeJob(jobId);
     return null;
   }
-  const updated = flowPlaylistConfig.updateSharedPlaylist(playlist.id, {
-    ...updates,
-    tracks: canonicalTracks,
-  });
+  const legacyJobs = downloadTracker.getByPlaylistId(playlist.id);
+  const retainedJobIds = new Set(
+    canonicalTracks.map((track) => String(track.canonicalJobId || "").trim()).filter(Boolean),
+  );
+  const jobsToRemove = legacyJobs.filter((job) => !retainedJobIds.has(job.id));
+  const legacyJobIds = jobsToRemove.map((job) => job.id);
+  const activeJobsToRemove = jobsToRemove.filter((job) => !isDownloadJobCancelled(job.id));
+  const restoreLegacyJobs = () => {
+    restoreDownloadJobCancellations(activeJobsToRemove.map((job) => job.id));
+    for (const job of activeJobsToRemove) {
+      if (downloadTracker.getJob(job.id)?.status === "downloading") {
+        downloadTracker.setFailed(job.id, "Playlist edit failed during download cancellation");
+      }
+    }
+  };
+  let updated;
+  try {
+    await cancelLegacyPlaylistJobs(jobsToRemove);
+    updated = await withHonkerLock(`playlist-mutation:${playlist.id}`, async () => {
+      const replacement = flowPlaylistConfig.updateSharedPlaylist(playlist.id, {
+        ...updates,
+        tracks: canonicalTracks,
+      });
+      if (!replacement) return null;
+      for (const job of jobsToRemove) {
+        const current = downloadTracker.getJob(job.id);
+        if (!current) continue;
+        if (current.status === "done" && current.finalPath && current.managedBy === "aurral" && !current.externalPath) {
+          try {
+            const removal = await removePlaylistFileIfUnshared(current.finalPath, playlist.id, {
+              weeklyFlowRoot: playlistManager.weeklyFlowRoot,
+              excludeJobIds: legacyJobIds,
+              deleteIfUnshared: true,
+            });
+            if (removal.action !== "deleted" && removal.action !== "relocated") {
+              logger.warn("subsonic", "Retaining legacy playlist job with an unremoved file", {
+                playlistId: playlist.id,
+                jobId: current.id,
+                action: removal.action,
+              });
+              continue;
+            }
+          } catch (error) {
+            logger.warn("subsonic", "Retaining legacy playlist job after file cleanup failed", {
+              playlistId: playlist.id,
+              jobId: current.id,
+              reason: error?.message || String(error),
+            });
+            continue;
+          }
+        }
+        downloadTracker.removeJob(current.id);
+      }
+      return replacement;
+    }, {
+      ttlSeconds: 180,
+      waitTimeoutMs: 15 * 60 * 1000,
+      retryDelayMs: 250,
+    });
+  } catch (error) {
+    for (const jobId of createdJobIds) downloadTracker.removeJob(jobId);
+    restoreLegacyJobs();
+    throw error;
+  }
   if (!updated) {
     for (const jobId of createdJobIds) downloadTracker.removeJob(jobId);
+    restoreLegacyJobs();
     return null;
   }
-  removeLegacyPlaylistJobs(playlist.id);
   refreshSubsonicPlaylist(playlist.id);
   return updated;
 };
 
-export function createSubsonicPlaylist(user, { name, songIds = [] } = {}) {
+export async function createSubsonicPlaylist(user, { name, songIds = [] } = {}) {
   if (!hasPermission(user, "accessFlow")) return null;
   const safeName = String(name || "").trim();
   if (!safeName) return null;
@@ -710,51 +949,55 @@ export function createSubsonicPlaylist(user, { name, songIds = [] } = {}) {
     ownerUserId: user.id,
     tracks: [],
   });
-  const updated = replaceSubsonicPlaylistTracks(
-    user,
-    playlist,
-    resolved.map((entry) => entry.track),
-  );
-  if (!updated) flowPlaylistConfig.deleteSharedPlaylist(playlist.id);
-  return updated;
+  try {
+    const updated = await replaceSubsonicPlaylistTracks(
+      user,
+      playlist,
+      resolved.map((entry) => entry.track),
+    );
+    if (!updated) flowPlaylistConfig.deleteSharedPlaylist(playlist.id);
+    return updated;
+  } catch (error) {
+    flowPlaylistConfig.deleteSharedPlaylist(playlist.id);
+    throw error;
+  }
 }
 
-export function updateSubsonicPlaylist(
+export async function updateSubsonicPlaylist(
   user,
   { playlistId, name, comment, songIdsToAdd = [], songIndexesToRemove = [] } = {},
 ) {
-  const playlist = flowPlaylistConfig.getSharedPlaylistForUser(
-    user,
-    normalizeSharedPlaylistId(playlistId),
-  );
-  if (!playlist || !hasPermission(user, "accessFlow")) return null;
-  const resolvedAdds = songIdsToAdd.map((id) => resolveSubsonicTrack(user, id));
-  if (resolvedAdds.some((entry) => !entry)) return null;
-  const removals = new Set(songIndexesToRemove);
-  const currentTracks = playlist.tracks.filter((_track, index) => !removals.has(index));
-  const nextTracks = [
-    ...currentTracks,
-    ...resolvedAdds.map((entry) => entry.track),
-  ];
-  const updates = {};
-  if (name !== undefined) updates.name = String(name || "").trim();
-  if (comment !== undefined) updates.description = String(comment || "").trim() || null;
-  return replaceSubsonicPlaylistTracks(user, playlist, nextTracks, updates);
+  return withHonkerLock("weekly-flow-operation", async () => {
+    const playlist = flowPlaylistConfig.getSharedPlaylistForUser(
+      user,
+      normalizeSharedPlaylistId(playlistId),
+    );
+    if (!playlist || !hasPermission(user, "accessFlow")) return null;
+    const resolvedAdds = songIdsToAdd.map((id) => resolveSubsonicTrack(user, id));
+    if (resolvedAdds.some((entry) => !entry)) return null;
+    const removals = new Set(songIndexesToRemove);
+    const currentTracks = playlist.tracks.filter((_track, index) => !removals.has(index));
+    const nextTracks = [
+      ...currentTracks,
+      ...resolvedAdds.map((entry) => entry.track),
+    ];
+    const updates = {};
+    if (name !== undefined) updates.name = String(name || "").trim();
+    if (comment !== undefined) updates.description = String(comment || "").trim() || null;
+    return replaceSubsonicPlaylistTracks(user, playlist, nextTracks, updates);
+  });
 }
 
-export function deleteSubsonicPlaylist(user, playlistId) {
+export async function deleteSubsonicPlaylist(user, playlistId) {
   const playlist = flowPlaylistConfig.getSharedPlaylistForUser(
     user,
     normalizeSharedPlaylistId(playlistId),
   );
   if (!playlist || !hasPermission(user, "accessFlow")) return false;
-  removeLegacyPlaylistJobs(playlist.id);
-  const deleted = flowPlaylistConfig.deleteSharedPlaylist(playlist.id);
-  if (deleted) {
-    playlistManager.updateConfig(false);
-    playlistManager.deletePlaybackPlaylist(playlist).catch(() => {});
-  }
-  return deleted;
+  return processWeeklyFlowOperation({
+    kind: "shared-playlist-delete",
+    playlistId: playlist.id,
+  });
 }
 
 const starTarget = (value) => {
@@ -800,7 +1043,11 @@ export function starMany(user, values, { skipCanonicalValidation = false } = {})
     }
   }
   const addStars = db.transaction(() => {
-    for (const target of parsed) addStarStmt.run(user.id, target.kind, target.key, Date.now());
+    let changed = false;
+    for (const target of parsed) {
+      changed = addStarStmt.run(user.id, target.kind, target.key, Date.now()).changes > 0 || changed;
+    }
+    if (changed) touchStars(user.id);
   });
   addStars();
   return true;
@@ -813,21 +1060,24 @@ export function unstar(user, value) {
 export function unstarMany(user, values) {
   const parsed = values.map(starTarget);
   if (!parsed.length || parsed.some((target) => !target) || !user?.id) return false;
-  const targetKeys = new Set(parsed.flatMap((target) => {
-    const row = { entity_kind: target.kind, entity_key: target.key };
-    const canonical = canonicalStarRow(user, row);
-    return [row, canonical].map((entry) => `${entry.entity_kind}:${entry.entity_key}`);
-  }));
+  const targetRows = parsed.map((target) => ({ entity_kind: target.kind, entity_key: target.key }));
+  const targetKeys = new Set(
+    [...targetRows, ...canonicalStarRows(user, targetRows)].map((entry) => `${entry.entity_kind}:${entry.entity_key}`),
+  );
+  const rows = starredRows(user);
+  const canonicalRows = canonicalStarRows(user, rows);
   const removeStars = db.transaction(() => {
-    for (const row of starredRows(user)) {
-      const canonical = canonicalStarRow(user, row);
+    let changed = false;
+    rows.forEach((row, index) => {
+      const canonical = canonicalRows[index];
       if (
         targetKeys.has(`${row.entity_kind}:${row.entity_key}`) ||
         targetKeys.has(`${canonical.entity_kind}:${canonical.entity_key}`)
       ) {
-        removeStarStmt.run(user.id, row.entity_kind, row.entity_key);
+        changed = removeStarStmt.run(user.id, row.entity_kind, row.entity_key).changes > 0 || changed;
       }
-    }
+    });
+    if (changed) touchStars(user.id);
   });
   removeStars();
   return true;
@@ -835,11 +1085,24 @@ export function unstarMany(user, values) {
 
 const starredRows = (user) => (user?.id ? getStarsStmt.all(user.id) : []);
 
+const starredAtFromRows = (rows) => {
+  const starredAt = new Map();
+  for (const row of rows) {
+    const key = `${row.entity_kind}:${row.entity_key}`;
+    if (!starredAt.has(key)) {
+      starredAt.set(key, new Date(Number(row.created_at) || Date.now()).toISOString());
+    }
+  }
+  return starredAt;
+};
+
+// Star timestamps keyed by protocol id, with playlist-song stars resolved to their canonical track.
+const starredAtFor = (user) => starredAtFromRows(canonicalStarRows(user, starredRows(user)));
+
 export function getStarredIdentityKeys(user) {
-  return new Set(starredRows(user).map((row) => {
-    const canonical = canonicalStarRow(user, row);
-    return `${canonical.entity_kind}:${canonical.entity_key}`;
-  }));
+  return new Set(
+    canonicalStarRows(user, starredRows(user)).map((row) => `${row.entity_kind}:${row.entity_key}`),
+  );
 }
 
 const buildStarred = (library, rows, user) => {
@@ -854,45 +1117,52 @@ const buildStarred = (library, rows, user) => {
         : null;
       const job = separator > 0 ? downloadTracker.getJob(parsed.key.slice(separator + 1)) : null;
       if (playlist && playlistOwnsJob(playlist, job)) {
-        starred.song.push(toPlaylistSong(playlist, kind, job));
+        // Rows still flagged as playlist songs did not resolve to a library track above.
+        starred.song.push(toPlaylistSong(playlist, kind, job, library.starredAt, null));
       }
       continue;
     }
     const entity = findCanonical(library, parsed);
     if (!entity) continue;
-    if (parsed.kind === "artist") starred.artist.push(toArtistSummary(entity));
+    if (parsed.kind === "artist") starred.artist.push(toArtistSummary(entity, library));
     if (parsed.kind === "album") starred.album.push(toAlbumSummary(library, entity));
     if (parsed.kind === "song") starred.song.push(toSong(library, entity));
   }
   return starred;
 };
 
-export function getStarredWithLibrary(user) {
-  const rows = starredRows(user).map((row) => canonicalStarRow(user, row));
+export function getStarredWithLibrary(user, { availableOnly = false } = {}) {
+  // Several playlist-song stars can resolve to the same library track; render it once.
+  const seen = new Set();
+  const rows = canonicalStarRows(user, starredRows(user)).filter((row) => {
+    const key = `${row.entity_kind}:${row.entity_key}`;
+    return seen.has(key) ? false : seen.add(key);
+  });
   const canonicalRows = rows.filter((row) => ["artist", "album", "song"].includes(row.entity_kind));
   const library = getCanonicalLibrary({
+    availableOnly,
     favoriteKeys: canonicalRows.map((row) => ({ kind: row.entity_kind, key: row.entity_key })),
   });
-  return { starred: buildStarred(indexFocusedLibrary(library), rows, user), library };
+  return { starred: buildStarred(indexFocusedLibrary(library, starredAtFromRows(rows)), rows, user), library };
 }
 
 export function getStarred(user) {
-  return getStarredWithLibrary(user).starred;
+  return getStarredWithLibrary(user, { availableOnly: true }).starred;
 }
 
 export function getArtistInfo(value) {
   return getArtist(value) ? { similarArtist: [] } : null;
 }
 
-export function getTopSongs(artist, options = {}) {
+export function getTopSongs(artist, options = {}, user = null) {
   const target = String(artist || "").trim();
   if (!target) return [];
   const library = indexFocusedLibrary(getCanonicalTopTracks({
     source: "all",
-    availableOnly: false,
+    availableOnly: true,
     artist: target,
     limit: normalizeLimit(options.count),
-  }));
+  }), starredAtFor(user));
   return library.tracks.map((track) => toSong(library, track));
 }
 
@@ -938,6 +1208,8 @@ export function getFlowPlaylist(value, user) {
   const playlist = playlistFromId(user, value);
   if (!playlist) return null;
   const jobs = flowJobs(playlist);
+  const starredAt = starredAtFor(user);
+  const owned = resolveCanonicalTracks(jobs.map((job) => trackFromJob(job)));
   return {
     id: idFor(kind, playlist.id),
     name: playlist.name,
@@ -946,7 +1218,11 @@ export function getFlowPlaylist(value, user) {
     songCount: jobs.length,
     duration: jobs.reduce((total, job) => total + seconds(job.durationMs), 0),
     public: false,
-    entry: jobs.map((job) => toPlaylistSong(playlist, kind, job)),
+    created: new Date(playlist.createdAt || Date.now()).toISOString(),
+    changed: new Date(
+      (kind === "flow" ? playlist.lastRunAt : playlist.importedAt) || playlist.createdAt || Date.now(),
+    ).toISOString(),
+    entry: jobs.map((job, index) => toPlaylistSong(playlist, kind, job, starredAt, owned[index])),
   };
 }
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { Link, useLocation, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router";
 import { useDiscoverNavigation } from "../../hooks/useDiscoverNavigation";
 import { DotLoader } from "../../components/DotLoader";
 import {
@@ -36,12 +36,15 @@ import {
   matchesReleaseGroupSearch,
   matchesReleaseGroupTab,
 } from "./releaseFilters.js";
-import { getAlbumAddButtonLabel } from "../../utils/albumAddAction";
+import { getAlbumAddAction } from "../../utils/albumAddAction";
+import { useLibraryDestination } from "../../hooks/useLibraryDestination";
 import {
   getArtistAppearsOnPage,
   getReleaseGroupRatingsBatch,
 } from "../../utils/api/endpoints/artists.js";
 import { queryKeys } from "../../queryClient.js";
+import TooltipButton from "../../components/TooltipButton";
+import Tooltip from "../../components/Tooltip";
 
 const RELEASE_PAGE_SIZE = 24;
 
@@ -87,7 +90,8 @@ function ArtistReleaseListPage({ mode = "releases" }) {
   const { mbid } = useParams();
   const { state } = useLocation();
   const navigate = useDiscoverNavigation();
-  const { showSuccess, showError } = useToast();
+  const { showSuccess, showError, showInfo } = useToast();
+  const libraryDestination = useLibraryDestination();
   const { hasPermission } = useAuth();
   const [selectedTab, setSelectedTab] = useState("all");
   const [showLiveAlbums, setShowLiveAlbums] = useState(true);
@@ -153,6 +157,8 @@ function ArtistReleaseListPage({ mode = "releases" }) {
     appSettings,
     showSuccess,
     showError,
+    showInfo,
+    libraryDestination,
   });
 
   const releaseGroups = useMemo(
@@ -433,11 +439,6 @@ function ArtistReleaseListPage({ mode = "releases" }) {
           <div className="artist-min-0">
             <h2 className="artist-release-card__title artist-truncate">{releaseGroup.title}</h2>
             <p className="artist-release-card__meta artist-truncate">{metaLabel}</p>
-            {isAppearsOn && releaseGroup._appearsOnTrack ? (
-              <p className="artist-release-card__meta artist-truncate">
-                {releaseGroup._appearsOnTrack}
-              </p>
-            ) : null}
           </div>
           <div className="artist-row-actions">
             {metric.label && (
@@ -447,20 +448,24 @@ function ArtistReleaseListPage({ mode = "releases" }) {
               </span>
             )}
             {isComplete ? (
-              <span className="artist-release-card__status" title="Complete">
-                <SearchLibraryCheck size="overlay" />
-                <span className="sr-only">Complete</span>
-              </span>
+              <Tooltip content="Complete">
+                <span className="artist-release-card__status" >
+                  <SearchLibraryCheck size="overlay" />
+                  <span className="sr-only">Complete</span>
+                </span>
+              </Tooltip>
             ) : canAddAlbum ? (
               <div onClick={(event) => event.stopPropagation()}>
                 <AddActionButton
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    library.handleRequestAlbum(releaseGroup.id, releaseGroup.title);
-                  }}
+                  {...getAlbumAddAction(
+                    { status: status?.status, managedBy: status?.albumInfo?.managedBy },
+                    libraryDestination,
+                  )}
+                  ownerConflict={status?.ownerConflict}
+                  onAdd={(managedBy) =>
+                    library.handleRequestAlbum(releaseGroup.id, releaseGroup.title, managedBy)}
                   isLoading={library.requestingAlbum === releaseGroup.id}
                   disabled={library.requestingAlbum === releaseGroup.id}
-                  label={getAlbumAddButtonLabel({ status: status?.status })}
                 />
               </div>
             ) : null}
@@ -485,37 +490,37 @@ function ArtistReleaseListPage({ mode = "releases" }) {
           )}
           <div className="artist-release-card__action">
             {isComplete ? (
-              <span className="artist-release-card__status" title="Complete">
-                <SearchLibraryCheck size="overlay" />
-                <span className="sr-only">Complete</span>
-              </span>
+              <Tooltip content="Complete">
+                <span className="artist-release-card__status" >
+                  <SearchLibraryCheck size="overlay" />
+                  <span className="sr-only">Complete</span>
+                </span>
+              </Tooltip>
             ) : canAddAlbum ? (
               <div onClick={(event) => event.stopPropagation()}>
                 <AddActionButton
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    library.handleRequestAlbum(releaseGroup.id, releaseGroup.title);
-                  }}
+                  {...getAlbumAddAction(
+                    { status: status?.status, managedBy: status?.albumInfo?.managedBy },
+                    libraryDestination,
+                  )}
+                  ownerConflict={status?.ownerConflict}
+                  onAdd={(managedBy) =>
+                    library.handleRequestAlbum(releaseGroup.id, releaseGroup.title, managedBy)}
                   isLoading={library.requestingAlbum === releaseGroup.id}
                   disabled={library.requestingAlbum === releaseGroup.id}
-                  label={getAlbumAddButtonLabel({ status: status?.status })}
                 />
               </div>
             ) : null}
           </div>
         </div>
-        <h2
-          className={`artist-release-card__title ${isAppearsOn ? "artist-clamp-2" : "artist-truncate"}`}
-          title={releaseGroup.title}
-        >
-          {releaseGroup.title}
-        </h2>
+        <Tooltip content={releaseGroup.title}>
+          <h2
+            className={`artist-release-card__title ${isAppearsOn ? "artist-clamp-2" : "artist-truncate"}`}
+          >
+            {releaseGroup.title}
+          </h2>
+        </Tooltip>
         <p className="artist-release-card__meta artist-truncate">{metaLabel}</p>
-        {isAppearsOn && releaseGroup._appearsOnTrack ? (
-          <p className="artist-release-card__meta artist-truncate">
-            {releaseGroup._appearsOnTrack}
-          </p>
-        ) : null}
         {metric.label && (
           <p className="artist-release-card__metric">
             <Star className="artist-star-icon" />
@@ -621,7 +626,7 @@ function ArtistReleaseListPage({ mode = "releases" }) {
           </div>
 
           <div className="library-page__view-controls">
-            <button
+            <TooltipButton
               type="button"
               onClick={() => handleViewModeChange(viewMode === "grid" ? "list" : "grid")}
               className="btn btn-icon-square library-page__view-toggle"
@@ -633,7 +638,7 @@ function ArtistReleaseListPage({ mode = "releases" }) {
               ) : (
                 <LayoutGrid className="artist-icon-sm" />
               )}
-            </button>
+            </TooltipButton>
           </div>
         </div>
 

@@ -15,6 +15,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, cwd(), "");
   const basePath = normalizeBasePathWithTrailingSlash(env.VITE_BASE_PATH || "/");
   const isDev = mode === "development";
+  const apiTarget = env.AURRAL_API_PROXY_TARGET || "http://localhost:3001";
 
   return {
     base: isDev ? "/" : basePath,
@@ -35,15 +36,21 @@ export default defineConfig(({ mode }) => {
           name: "Aurral - Music Discovery",
           short_name: "Aurral",
           description: "Self-hosted music discovery for the Lidarr stack",
-          theme_color: "#ffffff",
-          background_color: "#ffffff",
+          theme_color: "#050505",
+          background_color: "#050505",
           display: "standalone",
           orientation: "portrait",
           start_url: basePath,
           icons: [
             {
-              src: `${basePath}icons/aurral-icon-iOS-Default-1024x1024@1x.png`,
-              sizes: "1024x1024",
+              src: `${basePath}icons/aurral-icon-192.png`,
+              sizes: "192x192",
+              type: "image/png",
+              purpose: "any",
+            },
+            {
+              src: `${basePath}icons/aurral-icon-512.png`,
+              sizes: "512x512",
               type: "image/png",
               purpose: "any",
             },
@@ -65,7 +72,7 @@ export default defineConfig(({ mode }) => {
       port: 3000,
       proxy: {
         "/api": {
-          target: "http://localhost:3001",
+          target: apiTarget,
           changeOrigin: false,
           xfwd: true,
           secure: false,
@@ -74,13 +81,13 @@ export default defineConfig(({ mode }) => {
           proxyTimeout: 60000,
         },
         "/sso/callback": {
-          target: "http://localhost:3001",
+          target: apiTarget,
           changeOrigin: true,
           xfwd: true,
           secure: false,
         },
         "/ws": {
-          target: "ws://localhost:3001",
+          target: apiTarget.replace(/^http/, "ws"),
           ws: true,
         },
       },

@@ -17,14 +17,22 @@ import {
 import {
   getUnavailableFlowSourceError,
 } from "../../../services/weeklyFlow/weeklyFlowValidation.js";
+import { withPlaylistMutationLock } from "../../../services/weeklyFlow/weeklyFlowMutationGuards.js";
 import {
   DEFAULT_LIMIT,
   validateFlowPayload,
   markFlowMutationToken,
+  isFlowMutationTokenCurrent,
+  restoreFlowMutationToken,
   getAccessibleFlow,
   queueFlowSideEffect,
   enqueueResearchTrack,
 } from "./utils.js";
+import {
+  markPlaylistDownloadWorkCancelled,
+  restoreMarkedPlaylistDownloadWork,
+} from "../../../services/weeklyFlow/weeklyFlowDownloadCancellationService.js";
+import { logger } from "../../../services/logger.js";
 
 export function registerFlows(router) {
   router.post("/start/:flowId", async (req, res) => {
@@ -143,6 +151,7 @@ export function registerFlows(router) {
         size,
         deepDive,
         recordHistory,
+        showInLibrary,
         tags,
         relatedArtists,
         scheduleDays,
@@ -161,6 +170,7 @@ export function registerFlows(router) {
         size,
         deepDive,
         recordHistory,
+        showInLibrary,
         tags,
         relatedArtists,
         scheduleDays,
@@ -172,9 +182,14 @@ export function registerFlows(router) {
       if (Object.prototype.hasOwnProperty.call(req.body || {}, "yearTo")) {
         updates.yearTo = req.body.yearTo;
       }
-      const updated = flowPlaylistConfig.updateFlow(flowId, updates);
+      const updated = await withPlaylistMutationLock(flowId, () =>
+        flowPlaylistConfig.updateFlow(flowId, updates),
+      );
       if (!updated) {
         return res.status(404).json({ error: "Flow not found" });
+      }
+      if (typeof showInLibrary === "boolean") {
+        playlistManager.scheduleScanLibrary();
       }
       await playlistManager.ensureSmartPlaylists();
       res.json({ success: true, flow: updated });
@@ -198,14 +213,23 @@ export function registerFlows(router) {
       if (!getAccessibleFlow(req.user, flowId)) {
         return res.status(404).json({ error: "Flow not found" });
       }
-      const { token, tokenScope } = markFlowMutationToken(flowId);
-      const deleted = await weeklyFlowOperationQueue.enqueuePayload({
-        kind: "delete-flow",
-        label: `delete:${flowId}`,
-        flowId,
-        tokenScope,
-        token,
-      });
+      const jobs = downloadTracker.getByPlaylistId(flowId);
+      const cancellation = markPlaylistDownloadWorkCancelled(flowId, jobs);
+      const mutation = markFlowMutationToken(flowId);
+      let deleted;
+      try {
+        deleted = await weeklyFlowOperationQueue.enqueuePayload({
+          kind: "delete-flow",
+          label: `delete:${flowId}`,
+          flowId,
+          tokenScope: mutation.tokenScope,
+          token: mutation.token,
+        });
+      } catch (error) {
+        restoreMarkedPlaylistDownloadWork(flowId, cancellation);
+        restoreFlowMutationToken(mutation);
+        throw error;
+      }
       return res.json({
         success: true,
         flowId,
@@ -257,15 +281,46 @@ export function registerFlows(router) {
 
         queueFlowSideEffect("enable-flow-refresh", "enable", flowId);
       } else {
+        const wasEnabled = flow.enabled === true;
+        const jobs = downloadTracker.getByPlaylistId(flowId);
+        const cancellation = markPlaylistDownloadWorkCancelled(flowId, jobs);
         flowPlaylistConfig.setEnabled(flowId, false);
-        await playlistManager.ensureSmartPlaylists();
+        const mutation = markFlowMutationToken(flowId);
+
+        let queued;
+        try {
+          await playlistManager.ensureSmartPlaylists();
+          queued = await weeklyFlowOperationQueue.enqueuePayload({
+            kind: "disable-flow-cleanup",
+            label: `disable:${flowId}`,
+            flowId,
+            tokenScope: mutation.tokenScope,
+            token: mutation.token,
+          });
+        } catch (error) {
+          if (!isFlowMutationTokenCurrent(mutation)) throw error;
+          flowPlaylistConfig.setEnabled(flowId, wasEnabled);
+          if (wasEnabled) flowPlaylistConfig.scheduleNextRun(flowId);
+          restoreMarkedPlaylistDownloadWork(flowId, cancellation);
+          restoreFlowMutationToken(mutation);
+          try {
+            await playlistManager.ensureSmartPlaylists();
+          } catch (restoreError) {
+            logger.error("weeklyFlow", "Failed to restore playlists after a rejected flow disable", {
+              flowId,
+              message: restoreError.message,
+            });
+          }
+          throw error;
+        }
 
         res.json({
           success: true,
           flowId,
           enabled: false,
+          queued: true,
+          operationId: queued.operationId,
         });
-        queueFlowSideEffect("disable-flow-cleanup", "disable", flowId);
       }
     } catch (error) {
       res.status(500).json({
@@ -319,6 +374,7 @@ export function registerFlows(router) {
         name: requestedName || `${flow.name} Static`,
         sourceName: flow.name,
         sourceFlowId: flowId,
+        recordHistory: flow.recordHistory !== false,
         tracks,
         ownerUserId: flow.ownerUserId ?? req.user.id,
       });

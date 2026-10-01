@@ -10,10 +10,6 @@ import {
   createMockHttpServer,
   resetDatabase,
 } from "../helpers/backendTestHarness.js";
-import {
-  isBeetsMatcherAvailable,
-  resetMatcherAvailability,
-} from "../../backend/services/trackMatching/index.js";
 
 const [
   isolatedState,
@@ -26,6 +22,7 @@ const [
   pipelineHelpersModule,
   playlistManagerModule,
   weeklyFlowWorkerModule,
+  cancellationModule,
 ] = await setupIsolatedBackend(
   "download-review-routing",
   "backend/services/weeklyFlow/weeklyFlowDownloadTracker.js",
@@ -37,17 +34,15 @@ const [
   "backend/services/pipelineHelpers.js",
   "backend/services/weeklyFlow/weeklyFlowPlaylistManager.js",
   "backend/services/weeklyFlow/weeklyFlowWorker.js",
+  "backend/services/weeklyFlow/weeklyFlowDownloadCancellation.js",
 );
 
 const { blockPipelineJobForReview, finalizePipelineJobSuccess } = pipelineHelpersModule;
 
-// The unified download pipeline validates identity through the bundled beets
-// matcher; without it these end-to-end flows cannot run.
-resetMatcherAvailability();
-const matcherAvailable = await isBeetsMatcherAvailable();
-const btest = (name, fn) => test(name, { skip: matcherAvailable ? false : "beets not installed for any available Python interpreter" }, fn);
+const btest = test;
 const { playlistManager } = playlistManagerModule;
 const { weeklyFlowWorker } = weeklyFlowWorkerModule;
+const { cancelDownloadJob } = cancellationModule;
 
 test("yt-dlp keeps ordinary not-live results and excludes live statuses", () => {
   assert.equal(isYtdlpLiveResult({ liveStatus: "not_live" }), false);
@@ -96,6 +91,41 @@ test("Usenet file collection only scans the current history directory", async ()
   }
 });
 
+test("cancelling deemix finalization leaves a provider-reported library file untouched", async () => {
+  const filePath = path.join(process.env.DOWNLOAD_FOLDER, "existing-library-song.mp3");
+  await writeOneSecondMp3(filePath);
+  const jobId = downloadTracker.addJob(
+    { artistName: "Artist Name", trackName: "Correct Track", albumName: "Album Name" },
+    "deemix-source-safety",
+  );
+  downloadTracker.setDownloading(jobId);
+  const server = await createMockHttpServer((req, res) => {
+    req.resume();
+    cancelDownloadJob(jobId);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ result: true }));
+  });
+
+  try {
+    dbOps.updateSettings({
+      integrations: { deemix: { enabled: true, url: server.url, bitrate: 1 } },
+    });
+    const result = await processDeemixPipelinePayload({
+      phase: "finalize",
+      source: "deemix",
+      jobId,
+      queueUuid: "track_1_1",
+      downloadedPath: filePath,
+      candidate: { raw: { title: "Correct Track", artist: "Artist Name" } },
+    });
+
+    assert.equal(result, null);
+    await access(filePath);
+  } finally {
+    await server.close();
+  }
+});
+
 test.beforeEach(() => {
   resetDatabase(db);
 });
@@ -136,7 +166,7 @@ test("pipeline completion leaves the library scan to playlist completion", async
   );
 });
 
-async function writeOneSecondMp3(filePath) {
+async function writeOneSecondMp3(filePath, { title = "Correct Track", artist = "Artist Name" } = {}) {
   await mkdir(path.dirname(filePath), { recursive: true });
   const generated = spawnSync(
     "ffmpeg",
@@ -154,6 +184,10 @@ async function writeOneSecondMp3(filePath) {
       "libmp3lame",
       "-b:a",
       "128k",
+      "-metadata",
+      `title=${title}`,
+      "-metadata",
+      `artist=${artist}`,
       filePath,
     ],
     { encoding: "utf8" },
@@ -276,7 +310,7 @@ btest("yt-dlp auto-rejects weak title matches instead of reviewing them", async 
   assert.equal(result, null);
   await assert.rejects(() => access(filePath), undefined, "the wrong-track file must be removed");
   assert.equal(sourceFailures.length, 1);
-  assert.match(sourceFailures[0], /does not match the requested track/);
+  assert.match(sourceFailures[0], /filename-title/);
 });
 
 btest("yt-dlp holds partially-matching identity for review", async () => {
@@ -296,7 +330,7 @@ btest("yt-dlp holds partially-matching identity for review", async () => {
     jobId,
     "Correct.mp3",
   );
-  await writeOneSecondMp3(filePath);
+  await writeOneSecondMp3(filePath, { title: "Correct" });
 
   const result = await processYtdlpPipelinePayload(
     {
@@ -319,7 +353,7 @@ btest("yt-dlp holds partially-matching identity for review", async () => {
   assert.equal(result, null);
   const job = downloadTracker.getJob(jobId);
   assert.equal(job.status, "blocked");
-  assert.match(job.error, /moderate identity match|does not match/);
+  assert.match(job.error, /insufficient recording evidence/);
   assert.equal(job.stagingPath, filePath);
   await access(filePath);
 });

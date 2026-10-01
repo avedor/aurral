@@ -47,11 +47,15 @@ export function decorateJobQuality(job, profile = getQualityProfile()) {
   };
 }
 
-export function validateParsedQuality(parsed, filePath, { upgradeForJobId = null } = {}) {
+export function validateParsedQuality(
+  parsed,
+  filePath,
+  { upgradeForJobId = null, manualReplacementSearch = false, manualSelection = false } = {},
+) {
   const profile = getQualityProfile();
   const quality = classifyAudioQuality(parsed, filePath);
   const enabled = profile.enabled.includes(quality.tier);
-  if (!quality.tier || !enabled) {
+  if (!quality.tier || (!enabled && !manualSelection)) {
     return {
       valid: false,
       quality,
@@ -60,7 +64,7 @@ export function validateParsedQuality(parsed, filePath, { upgradeForJobId = null
         : "quality-unknown: could not classify final file",
     };
   }
-  if (upgradeForJobId) {
+  if (upgradeForJobId && !manualReplacementSearch) {
     const current = downloadTracker.getJob(upgradeForJobId);
     if (!current || !isQualityUpgrade(quality, current.qualityTier, profile)) {
       return {
@@ -212,11 +216,16 @@ export async function finalizeQualityUpgradeSuccess(upgradeJob, finalPath, quali
     trackName: originalDetails.trackName,
     artistName: original.artistName,
     albumName: original.albumName,
+    albumMbid: original.albumMbid,
     playlistId: originalDetails.playlistType,
-    title: `Upgraded ${originalDetails.trackName}`,
-    subtitle: `${originalDetails.qualityTier || "Unknown"} → ${quality?.tier || "Unknown"}`,
+    title: upgradeJob.manualReplacementSearch
+      ? `Re-searched ${originalDetails.trackName}`
+      : `Upgraded ${originalDetails.trackName}`,
+    subtitle: upgradeJob.manualReplacementSearch
+      ? "A replacement recording was added"
+      : `${originalDetails.qualityTier || "Unknown"} → ${quality?.tier || "Unknown"}`,
     status: "completed",
-    statusLabel: "Upgraded",
+    statusLabel: upgradeJob.manualReplacementSearch ? "Replaced" : "Upgraded",
     downloadSource: upgradeJob.downloadSource,
     downloadClient: upgradeJob.downloadClient,
   });
@@ -225,7 +234,9 @@ export async function finalizeQualityUpgradeSuccess(upgradeJob, finalPath, quali
 
 export async function finalizeQualityUpgradeFailure(upgradeJob, message) {
   const original = downloadTracker.getJob(upgradeJob?.upgradeForJobId);
-  if (original) downloadTracker.markQualityUpgradeChecked(original.id);
+  if (original && !upgradeJob?.manualReplacementSearch) {
+    downloadTracker.markQualityUpgradeChecked(original.id);
+  }
   if (upgradeJob?.id) downloadTracker.removeJob(upgradeJob.id);
   if (!original) return;
   const { recordTrackJobActivity } = await import("./aurralHistoryService.js");
@@ -234,11 +245,19 @@ export async function finalizeQualityUpgradeFailure(upgradeJob, message) {
     trackName: original.trackName,
     artistName: original.artistName,
     albumName: original.albumName,
+    albumMbid: original.albumMbid,
     playlistId: original.playlistType,
-    title: `No upgrade found for ${original.trackName}`,
-    subtitle: String(message || "No better file was available"),
+    title: upgradeJob.manualReplacementSearch
+      ? `No replacement found for ${original.trackName}`
+      : `No upgrade found for ${original.trackName}`,
+    subtitle: String(
+      message ||
+        (upgradeJob.manualReplacementSearch
+          ? "No replacement file was available"
+          : "No better file was available"),
+    ),
     status: "failed",
-    statusLabel: "No upgrade",
+    statusLabel: upgradeJob.manualReplacementSearch ? "No replacement" : "No upgrade",
     downloadSource: upgradeJob.downloadSource,
     downloadClient: upgradeJob.downloadClient,
   });

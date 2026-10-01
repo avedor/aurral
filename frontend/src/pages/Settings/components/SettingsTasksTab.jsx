@@ -6,6 +6,7 @@ import { SettingsArrFieldSet } from "./arr/SettingsArrLayout";
 
 import { AlertCircle, Check, Clock, XCircle } from "lucide-react";
 import { DotLoader } from "../../../components/DotLoader";
+import Tooltip from "../../../components/Tooltip";
 const POLL_INTERVAL_MS = 5000;
 
 const relativeFormatter = new Intl.RelativeTimeFormat(undefined, {
@@ -13,6 +14,12 @@ const relativeFormatter = new Intl.RelativeTimeFormat(undefined, {
 });
 
 const STATUS_META = {
+  interrupted: {
+    label: "Interrupted",
+    tone: "muted",
+    icon: Clock,
+    title: "Unfinished work was returned to the queue",
+  },
   completed: {
     label: "Completed",
     tone: "ok",
@@ -121,17 +128,18 @@ function StatusBadge({ status }) {
   };
   const Icon = meta.icon || AlertCircle;
   return (
-    <span
-      className={`arr-task-status arr-task-status--${meta.tone}`}
-      title={meta.title || undefined}
-    >
-      {meta.spinning ? (
-        <DotLoader size="sm" label={null} className="arr-task-status__icon" />
-      ) : (
-        <Icon className="arr-task-status__icon" aria-hidden />
-      )}
-      {meta.label}
-    </span>
+    <Tooltip content={meta.title || undefined}>
+      <span
+        className={`arr-task-status arr-task-status--${meta.tone}`}
+      >
+        {meta.spinning ? (
+          <DotLoader size="sm" label={null} className="arr-task-status__icon" />
+        ) : (
+          <Icon className="arr-task-status__icon" aria-hidden />
+        )}
+        {meta.label}
+      </span>
+    </Tooltip>
   );
 }
 
@@ -350,9 +358,11 @@ function QueueTable({ queue = [], loading = false }) {
             <th scope="col">
               {queue.some((task) => task.status === "running") ? "Running for" : "Duration"}
             </th>
-            <th scope="col" title="Retry count for jobs that can fail and re-run">
-              Attempt
-            </th>
+            <Tooltip content="Retry count for jobs that can fail and re-run">
+              <th scope="col" >
+                Attempt
+                </th>
+            </Tooltip>
           </tr>
         </thead>
         <tbody>
@@ -393,10 +403,12 @@ function QueueTable({ queue = [], loading = false }) {
                 <td>{formatRelative(task.queuedAt, "—")}</td>
                 <td>
                   {isFutureRunAt(task) ? (
-                    <span title="Runs at">
-                      <span className="arr-table__subtle">Runs at </span>
-                      {formatRelative(task.runAt, "—")}
-                    </span>
+                    <Tooltip content="Runs at">
+                      <span >
+                        <span className="arr-table__subtle">Runs at </span>
+                        {formatRelative(task.runAt, "—")}
+                      </span>
+                    </Tooltip>
                   ) : task.startedAt ? (
                     formatRelative(task.startedAt)
                   ) : (
