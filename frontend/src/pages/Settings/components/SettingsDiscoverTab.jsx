@@ -95,13 +95,17 @@ export function SettingsDiscoverTab({
         {showLastfmDiscoverBanner && (
           <div className="settings-page__banner">
             <div className="settings-page__banner-copy">
-              <p className="settings-page__banner-title">Last.fm recommendations</p>
+              <p className="settings-page__banner-title">Personalized recommendations</p>
               <p className="settings-page__banner-text">
-                Add a Last.fm API key in{" "}
+                Set a listening history provider in{" "}
+                <Link to="/profile" className="arr-link">
+                  Profile
+                </Link>{" "}
+                to get recommendations from your plays. A Last.fm API key in{" "}
                 <Link to="/settings/connect" className="arr-link">
                   Connect
                 </Link>{" "}
-                  for personalized recommendations, tags, and weekly flows.
+                also enables tag search, related artists, and weekly flows.
               </p>
             </div>
             <button
@@ -113,7 +117,7 @@ export function SettingsDiscoverTab({
                   localStorage.setItem(LASTFM_DISCOVER_BANNER_KEY, "1");
                 } catch {}
               }}
-              aria-label="Dismiss Last.fm recommendations"
+              aria-label="Dismiss personalized recommendations notice"
             >
               <X className="artist-icon-sm" />
             </button>
