@@ -29,7 +29,9 @@ import {
   buildListenbrainzFallbackDiscovery,
   getDiscoveryCapabilities,
   DISCOVERY_PROVIDER_LASTFM,
+  DISCOVERY_PROVIDER_LISTENBRAINZ,
 } from "../listenbrainzDiscoveryFallback.js";
+import { collectListenbrainzSeedTags } from "./listenbrainzRecommendations.js";
 import {
   enqueueDiscoveryPlaylistBuildJob,
   enqueueDiscoveryUserRefreshJob,
@@ -49,6 +51,7 @@ import {
   createDiscoveryRunId,
   selectDiscoverySeedSample,
   buildTrendingArtistEntry,
+  buildWeightedTopList,
   normalizePlaylistBuildStringList,
   mapWithConcurrency,
   DISCOVERY_QUALITY_ENRICHED,
@@ -133,7 +136,10 @@ export const requestUserDiscoveryRefresh = (
 ) => {
   const profile = getListenHistoryProfile(listenHistoryProfile);
   const cacheNamespace = getListenHistoryCacheNamespace(profile);
-  if (!cacheNamespace || !getLastfmApiKey()) {
+  if (
+    !cacheNamespace ||
+    (!getLastfmApiKey() && profile.listenHistoryProvider !== "listenbrainz")
+  ) {
     return Promise.resolve(null);
   }
   if (isGlobalDiscoveryRefreshInProgress()) {
@@ -345,6 +351,8 @@ const buildDiscoveryUpdatePayload = (
       getDiscoveryCapabilities(
         (discoveryData.provider || DISCOVERY_PROVIDER_LASTFM) ===
           DISCOVERY_PROVIDER_LASTFM,
+        (discoveryData.provider || DISCOVERY_PROVIDER_LASTFM) ===
+          DISCOVERY_PROVIDER_LISTENBRAINZ,
       ),
     lastUpdated: discoveryData.lastUpdated,
     recommendationQuality:
@@ -395,8 +403,6 @@ const scheduleDiscoverPlaylistBuild = ({
   publishUpdate = true,
   progressExtra = {},
 } = {}) => {
-  if (!getLastfmApiKey()) return;
-
   const buildKey = getDiscoveryPlaylistBuildKey(cacheNamespace);
   const buildToken = randomUUID();
   setDiscoveryPlaylistBuildToken(buildKey, buildToken);
@@ -454,6 +460,8 @@ export const updateDiscoveryCache = async (options = {}) => {
 
     const hasLastfmKey = !!getLastfmApiKey();
     const lastfmHealth = { success: 0, failure: 0 };
+    // Declared before the ListenBrainz branch below, which references it.
+    const existingArtistKeys = buildExistingArtistKeySet(allLibraryArtists);
 
     if (!hasLastfmKey) {
       logger.info(
@@ -470,13 +478,114 @@ export const updateDiscoveryCache = async (options = {}) => {
         },
       );
       const fallbackData = await buildListenbrainzFallbackDiscovery({
-        existingArtistKeys: buildExistingArtistKeySet(allLibraryArtists),
+        existingArtistKeys,
         onProgress: ({ phase, progress, progressMessage }) =>
           recordDiscoveryUpdateProgress(phase, progressMessage, progress, {
             provider: "listenbrainz-fallback",
             capabilities: getDiscoveryCapabilities(false),
           }),
       });
+
+      const listenbrainzProfiles = collectListeningHistoryRefreshProfiles()
+        .map((entry) => entry.profile)
+        .filter(
+          (profile) =>
+            profile.listenHistoryProvider === "listenbrainz" &&
+            Boolean(profile.listenHistoryUsername),
+        );
+      const listenbrainzTopArtists = [];
+      if (listenbrainzProfiles.length > 0) {
+        logger.info(
+          'discovery',
+          `Generating ListenBrainz recommendations from ${listenbrainzProfiles.length} listening history profile(s).`,
+        );
+        recordDiscoveryUpdateProgress(
+          "generating_recommendations",
+          "Generating ListenBrainz recommendations",
+          60,
+        );
+        const historyArtists = [];
+        const seenHistoryKeys = new Set();
+        for (const profile of listenbrainzProfiles) {
+          const artists = await fetchListenHistoryArtists(
+            profile,
+            getLastfmDiscoveryPeriod(),
+            lastfmHealth,
+          );
+          for (const artist of artists) {
+            const key = `${artist.mbid || ""}:${artist.artistName}`;
+            if (seenHistoryKeys.has(key)) continue;
+            seenHistoryKeys.add(key);
+            historyArtists.push({ ...artist, source: "listenbrainz" });
+            listenbrainzTopArtists.push(artist.artistName);
+          }
+        }
+        const seeds = buildDiscoverySeedList({
+          libraryArtists: [],
+          historyArtists,
+        });
+        const recSample = seeds.slice(
+          0,
+          getDiscoveryRecommendationSeedLimit(
+            seeds.length,
+            getLastfmFailureRatio(lastfmHealth),
+          ),
+        );
+        if (recSample.length > 0) {
+          const { tagMap, tagWeights } = await collectListenbrainzSeedTags(
+            recSample,
+            "building_genres",
+          );
+          const profileTagWeights = new Map();
+          for (const [tag, weight] of tagWeights.entries()) {
+            profileTagWeights.set(tag, Number(weight || 0));
+          }
+          const recommendationRunStartedAt = new Date().toISOString();
+          const rawRecommendations = await buildRecommendationsFromSeeds({
+            seeds: recSample,
+            existingArtistKeys,
+            lastfmHealth,
+            profileTagWeights,
+            seedTagMap: tagMap,
+            discoveryMode: getDiscoveryMode(),
+            includeCandidateTagHydration: true,
+            includeSecondHop: true,
+            source: "listenbrainz",
+          });
+          let recommendationsArray = await resolveRecommendationCandidates(
+            rawRecommendations,
+            existingArtistKeys,
+            40,
+            { resolveLimit: getDiscoveryRecommendationsPerRefresh() },
+          );
+          recommendationsArray = mergeRetainedRecommendationPool({
+            freshRecommendations: recommendationsArray,
+            existingRecommendations: [],
+            existingArtistKeys,
+            limit: getDiscoveryRecommendationPoolLimit(),
+            runStartedAt: recommendationRunStartedAt,
+            discoveryMode: getDiscoveryMode(),
+            feedback: getDiscoveryFeedback("global"),
+          });
+          fallbackData.recommendations = recommendationsArray;
+          fallbackData.basedOn = recSample.map((a) => ({
+            name: a.artistName,
+            id: a.mbid,
+            source: a.source || "listenbrainz",
+            profileBucket: a.profileBucket || null,
+          }));
+          fallbackData.topTags = buildWeightedTopList(tagWeights, 24);
+          fallbackData.topGenres = buildWeightedTopList(tagWeights, 24);
+          fallbackData.provider = DISCOVERY_PROVIDER_LISTENBRAINZ;
+          fallbackData.capabilities = getDiscoveryCapabilities(false, true);
+          fallbackData.lastUpdated = recommendationRunStartedAt;
+          logger.info(
+            'discovery',
+            `Generated ${recommendationsArray.length} ListenBrainz recommendations from ${recSample.length} seed artists.`,
+          );
+        }
+      }
+
       discoveryCache.isUpdating = false;
       Object.assign(discoveryCache, fallbackData, {
         isUpdating: false,
@@ -496,6 +605,26 @@ export const updateDiscoveryCache = async (options = {}) => {
         recommendationCount: fallbackData.recommendations?.length || 0,
         genreCount: fallbackData.topGenres?.length || 0,
       });
+      // This branch returns before the shared tail that schedules the playlist
+      // build, so Discover playlists have to be enqueued here too.
+      scheduleDiscoverPlaylistBuild({
+        historyTopArtists: listenbrainzTopArtists.slice(0, 3).filter(Boolean),
+        progressExtra: {
+          recommendations: fallbackData.recommendations || [],
+          globalTop: fallbackData.globalTop || [],
+          basedOn: fallbackData.basedOn || [],
+          topTags: fallbackData.topTags || [],
+          topGenres: fallbackData.topGenres || [],
+          fallbackGenres: fallbackData.fallbackGenres || [],
+          discoverPlaylists: discoveryCache.discoverPlaylists || [],
+          provider: fallbackData.provider || DISCOVERY_PROVIDER_LISTENBRAINZ,
+          lastUpdated: fallbackData.lastUpdated,
+        },
+      });
+      logger.info(
+        'discovery',
+        "Global refresh complete. Starting playlist build.",
+      );
       return;
     }
 
@@ -518,7 +647,6 @@ export const updateDiscoveryCache = async (options = {}) => {
       }),
       getLastfmFailureRatio(lastfmHealth),
     ).length;
-    const existingArtistKeys = buildExistingArtistKeySet(allLibraryArtists);
 
     const provisionalSeeds = buildDiscoverySeedList({
       libraryArtists: libraryArtists.map((a) => ({
@@ -847,7 +975,6 @@ export const updateUserDiscoveryCache = async (
   const profile = getListenHistoryProfile(listenHistoryProfile);
   const cacheNamespace = getListenHistoryCacheNamespace(profile);
   if (!cacheNamespace) return null;
-  if (!getLastfmApiKey()) return null;
   if (options.skipHonkerLock !== true) {
     return withHonkerLock(
       `discovery-user-refresh:${cacheNamespace}`,
@@ -973,6 +1100,8 @@ export const updateUserDiscoveryCache = async (
       libraryArtists: [],
       historyArtists,
     });
+    const recommendationSource =
+      profile.listenHistoryProvider === "listenbrainz" ? "listenbrainz" : "lastfm";
     let freshRecommendations = [];
     if (personalSeeds.length > 0) {
       const rawRecommendations = await buildRecommendationsFromSeeds({
@@ -984,6 +1113,7 @@ export const updateUserDiscoveryCache = async (
         discoveryMode: getDiscoveryMode(),
         includeCandidateTagHydration: false,
         includeSecondHop: true,
+        source: recommendationSource,
       });
       freshRecommendations = await resolveRecommendationCandidates(
         rawRecommendations,
@@ -1015,6 +1145,14 @@ export const updateUserDiscoveryCache = async (
       basedOn: basedOnArtists,
       topTags: globalTopTags,
       topGenres: globalTopGenres,
+      provider:
+        recommendationSource === "listenbrainz"
+          ? DISCOVERY_PROVIDER_LISTENBRAINZ
+          : DISCOVERY_PROVIDER_LASTFM,
+      capabilities: getDiscoveryCapabilities(
+        !!getLastfmApiKey(),
+        recommendationSource === "listenbrainz",
+      ),
       recommendationQuality: DISCOVERY_QUALITY_ENRICHED,
       isEnriching: false,
       discoveryRunId,

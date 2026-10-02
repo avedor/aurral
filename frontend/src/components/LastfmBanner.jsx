@@ -28,7 +28,7 @@ const readDismissed = (user) => {
   return false;
 };
 
-const LastfmBanner = () => {
+const LastfmBanner = ({ listenbrainzHistoryConfigured = false }) => {
   const { user, bootstrap } = useAuth();
   const [dismissed, setDismissed] = useState(() => readDismissed(user));
   const lastfmConfigured = bootstrap ? !!bootstrap.lastfmConfigured : null;
@@ -38,7 +38,12 @@ const LastfmBanner = () => {
     setDismissed(readDismissed(user));
   }, [user]);
 
-  if (dismissed || lastfmConfigured === null || lastfmConfigured) {
+  if (
+    dismissed ||
+    lastfmConfigured === null ||
+    lastfmConfigured ||
+    listenbrainzHistoryConfigured
+  ) {
     return null;
   }
 

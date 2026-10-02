@@ -1,5 +1,6 @@
 import { lastfmRequest, getLastfmApiKey } from "../apiClients/index.js";
 import { deezerGetTrackPreview } from "../apiClients/deezer.js";
+import { playlistSource } from "../weeklyFlow/weeklyFlowPlaylistSource.js";
 import { selectEditorialPresets } from "../../config/editorialPlaylistPresets.js";
 import { FIXED_DISCOVER_PLAYLIST_ARTWORK_COLORS } from "../../config/discoverPlaylistPresets.js";
 import { logger } from "../logger.js";
@@ -9,14 +10,14 @@ const ALBUM_ENRICH_CONCURRENCY = 2;
 const PREVIEW_ENRICH_CONCURRENCY = 4;
 
 const normalizeTrack = (track, rank) => ({
-  artistName: track?.artist?.name || null,
-  trackName: track?.name || null,
-  albumName: null,
-  artistMbid: track?.artist?.mbid || null,
-  albumMbid: null,
-  trackMbid: track?.mbid || null,
-  releaseYear: null,
-  reason: `#${rank} on Last.fm`,
+  artistName: track?.artistName || null,
+  trackName: track?.trackName || null,
+  albumName: track?.albumName || null,
+  artistMbid: track?.artistMbid || null,
+  albumMbid: track?.albumMbid || null,
+  trackMbid: track?.trackMbid || null,
+  releaseYear: track?.releaseYear || null,
+  reason: track?.reason || `#${rank} editorial pick`,
 });
 
 const buildEditorialPlaylistPreview = (preset, tracks) => ({
@@ -34,23 +35,10 @@ const buildEditorialPlaylistPreview = (preset, tracks) => ({
 
 async function buildPlaylistFromPreset(preset) {
   try {
-    const result = await lastfmRequest("tag.getTopTracks", {
-      tag: preset.tag,
-      limit: preset.size,
-    });
-
-    if (!result) {
-      logger.warn("discovery", `[EditorialPlaylists] ${preset.id} (${preset.tag}): API returned null — possible auth or network error`);
-      return null;
-    }
-
-    if (result.error) {
-      logger.warn("discovery", `[EditorialPlaylists] ${preset.id} (${preset.tag}): API error ${result.error} — ${result.message || ""}`);
-      return null;
-    }
-
-    const rawTracks = result?.tracks?.track;
-    const tracks = Array.isArray(rawTracks) ? rawTracks : rawTracks ? [rawTracks] : [];
+    // playlistSource resolves tag tracks through Last.fm when a key exists and
+    // falls back to ListenBrainz otherwise, so editorial playlists follow the
+    // same source selection as every other playlist builder.
+    const tracks = await playlistSource.getEditorialTagTracks(preset.tag, preset.size);
 
     if (tracks.length === 0) {
       logger.info("discovery", `[EditorialPlaylists] ${preset.id} (${preset.tag}): tag returned no tracks`);
@@ -68,6 +56,8 @@ async function enrichTrackWithAlbum(track) {
   const artistName = String(track?.artistName || "").trim();
   const trackName = String(track?.trackName || "").trim();
   if (!artistName || !trackName) return track;
+  // ListenBrainz entries already carry release names from MusicBrainz metadata.
+  if (!getLastfmApiKey()) return track;
   try {
     const info = await lastfmRequest("track.getInfo", {
       artist: artistName,
@@ -108,11 +98,6 @@ export async function enrichEditorialTracksWithDeezerPreviews(tracks) {
 }
 
 export async function generateEditorialPlaylists() {
-  if (!getLastfmApiKey()) {
-    logger.info("discovery", "[EditorialPlaylists] Skipped — Last.fm not configured");
-    return [];
-  }
-
   const presets = selectEditorialPresets();
   const playlists = [];
   for (let i = 0; i < presets.length; i += EDITORIAL_BUILD_CONCURRENCY) {

@@ -1,6 +1,5 @@
 import { userOps } from "../../db/helpers/index.js";
 import { randomUUID } from "crypto";
-import { getLastfmApiKey } from "../apiClients/index.js";
 import {
   buildFlowPayloadFromPreset,
   enrichDiscoverPlaylistForAdoption,
@@ -19,10 +18,12 @@ const resolveDiscoverAdoptContext = (user, presetId) => {
   const reqUser = userOps.getUserById(user?.id);
   const listenHistoryProfile = getListenHistoryProfile(reqUser || user || {});
   const userCacheNamespace = getListenHistoryCacheNamespace(listenHistoryProfile);
-  const effectiveCacheNamespace = getLastfmApiKey() ? userCacheNamespace : null;
-  const discoveryCache = getDiscoveryCache(effectiveCacheNamespace);
+  // Personalized playlists are cached per listening-history profile regardless
+  // of which provider generated them, so always prefer the user namespace and
+  // fall back to the shared cache.
+  const discoveryCache = getDiscoveryCache(userCacheNamespace);
   let cachedPlaylist = getCachedDiscoverPlaylist(discoveryCache, presetId);
-  if (!cachedPlaylist && effectiveCacheNamespace) {
+  if (!cachedPlaylist) {
     cachedPlaylist = getCachedDiscoverPlaylist(getDiscoveryCache(), presetId);
   }
   return { cachedPlaylist };

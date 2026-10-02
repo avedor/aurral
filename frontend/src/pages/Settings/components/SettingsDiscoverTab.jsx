@@ -65,8 +65,17 @@ export function SettingsDiscoverTab({
     settings.integrations?.lastfm?.discoveryRecommendationsPerRefresh ?? 200;
   const discoveryPersonalizedEnabled = settings.integrations?.lastfm?.discoveryPersonalizedEnabled !== false;
   const discoveryProvider =
-    health?.discovery?.provider === "listenbrainz-fallback" ? "ListenBrainz fallback" : "Last.fm";
+    health?.discovery?.provider === "listenbrainz-fallback"
+      ? "ListenBrainz fallback"
+      : health?.discovery?.provider === "listenbrainz"
+        ? "ListenBrainz"
+        : "Last.fm";
   const isListenBrainzFallback = health?.discovery?.provider === "listenbrainz-fallback";
+  // Undefined means "decide by provider": editorial shelves are cheap with a
+  // Last.fm key and slow via ListenBrainz tag lookups, so default them off
+  // for ListenBrainz-only setups while preserving Last.fm behavior.
+  const discoveryEditorialEnabled =
+    settings.integrations?.lastfm?.discoveryEditorialEnabled ?? health?.discovery?.provider === "lastfm";
   const showLastfmDiscoverBanner = isListenBrainzFallback && !lastfmBannerDismissed;
   const activeProgress = discoveryProgress ?? health?.discovery?.updateProgress;
   const showProgress = health?.discovery?.isUpdating || refreshingDiscovery;
@@ -91,13 +100,17 @@ export function SettingsDiscoverTab({
         {showLastfmDiscoverBanner && (
           <div className="settings-page__banner">
             <div className="settings-page__banner-copy">
-              <p className="settings-page__banner-title">Last.fm recommendations</p>
+              <p className="settings-page__banner-title">Personalized recommendations</p>
               <p className="settings-page__banner-text">
-                Add a Last.fm API key in{" "}
+                Set a listening history provider in{" "}
+                <Link to="/profile" className="arr-link">
+                  Profile
+                </Link>{" "}
+                to get recommendations from your plays. A Last.fm API key in{" "}
                 <Link to="/settings/connect" className="arr-link">
                   Connect
                 </Link>{" "}
-                  for personalized recommendations, tags, and weekly flows.
+                also enables tag search, related artists, and weekly flows.
               </p>
             </div>
             <button
@@ -109,7 +122,7 @@ export function SettingsDiscoverTab({
                   localStorage.setItem(LASTFM_DISCOVER_BANNER_KEY, "1");
                 } catch {}
               }}
-              aria-label="Dismiss Last.fm recommendations"
+              aria-label="Dismiss personalized recommendations notice"
             >
               <X className="artist-icon-sm" />
             </button>
@@ -210,6 +223,21 @@ export function SettingsDiscoverTab({
                     })
                   }
                   aria-label="Recommended playlists"
+                />
+              </SettingsArrFormGroup>
+              <SettingsArrFormGroup
+                label="Editorial playlists"
+                help="Curated genre, mood, and era shelves. Without a Last.fm key these resolve through ListenBrainz, which can add several minutes to a refresh."
+              >
+                <PillToggle
+                  className="settings-toggle"
+                  checked={discoveryEditorialEnabled}
+                  onChange={(e) =>
+                    updateLastfmDiscovery({
+                      discoveryEditorialEnabled: e.target.checked,
+                    })
+                  }
+                  aria-label="Editorial playlists"
                 />
               </SettingsArrFormGroup>
             </>

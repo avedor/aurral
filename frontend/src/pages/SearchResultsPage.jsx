@@ -1269,9 +1269,16 @@ function SearchResultsPage() {
 
   const localSearchConfigured = unifiedResults?.localSearchConfigured !== false;
 
+  // Recommendations come from Last.fm, ListenBrainz, or local plays depending
+  // on configuration, so only prompt for setup when nothing is personalized.
+  const discoveryPersonalized =
+    searchPages[0]?.capabilities?.personalizedRecommendations === true;
+  const showRecommendationsSetupPrompt =
+    normalizedType === "recommended" && !discoveryPersonalized;
+
   const emptyMessage =
-    normalizedType === "recommended" && lastfmConfigured === false
-      ? "Connect a Last.fm API key in Settings → Connect to populate recommendations."
+    showRecommendationsSetupPrompt
+      ? "Add artists to your library, or set a listening history provider in Profile, to populate recommendations. A Last.fm API key also works."
       : ["recommended", "trending", "tag"].includes(normalizedType)
         ? "Nothing to show here yet."
         : isUnifiedSearch && !localSearchConfigured
@@ -1284,10 +1291,9 @@ function SearchResultsPage() {
                 ? `We couldn't find any results for tag "${trimmedQuery.replace(/^#/, "")}"`
                 : `We couldn't find any results matching "${trimmedQuery}"`;
 
-  const emptyTitle =
-    normalizedType === "recommended" && lastfmConfigured === false
-      ? "Connect Last.fm"
-      : "No Results Found";
+  const emptyTitle = showRecommendationsSetupPrompt
+    ? "No recommendations yet"
+    : "No Results Found";
 
   const discoveryCount = recommendedSearchTerm.trim()
     ? discoveryArtists.length
@@ -1611,14 +1617,23 @@ function SearchResultsPage() {
               </div>
               <h2 className="search-empty-panel__title">{emptyTitle}</h2>
               <p className="search-empty-panel__message">{emptyMessage}</p>
-              {normalizedType === "recommended" && lastfmConfigured === false ? (
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => navigate("/settings/connect")}
-                >
-                  Open Last.fm settings
-                </button>
+              {showRecommendationsSetupPrompt ? (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => navigate("/profile")}
+                  >
+                    Set listening history
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => navigate("/settings/connect")}
+                  >
+                    Connect Last.fm
+                  </button>
+                </>
               ) : null}
             </div>
           ) : (

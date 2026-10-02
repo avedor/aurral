@@ -54,6 +54,7 @@ export const defaultData = {
         discoveryAutoRefreshHours: 168,
         discoveryRecommendationsPerRefresh: 200,
         discoveryPersonalizedEnabled: true,
+        discoveryEditorialEnabled: true,
         discoveryMode: "balanced",
       },
       slskd: {

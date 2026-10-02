@@ -7,9 +7,36 @@ import {
   musicbrainzResolveArtistMbidByName,
 } from "./apiClients/index.js";
 import { getArtistGenres } from "./providers/brainzmashProvider.js";
+import { userOps } from "../db/helpers/index.js";
+import { getListenHistoryProfile } from "./listeningHistory.js";
 
 export const DISCOVERY_PROVIDER_LASTFM = "lastfm";
+export const DISCOVERY_PROVIDER_LISTENBRAINZ = "listenbrainz";
 export const DISCOVERY_PROVIDER_LISTENBRAINZ_FALLBACK = "listenbrainz-fallback";
+
+export const hasListenbrainzHistoryProfile = () => {
+  try {
+    return userOps.getAllListeningHistoryUsers().some((user) => {
+      const profile = getListenHistoryProfile(user);
+      return (
+        profile.listenHistoryProvider === "listenbrainz" &&
+        Boolean(profile.listenHistoryUsername)
+      );
+    });
+  } catch {
+    return false;
+  }
+};
+
+export const isListenbrainzFlowsEnabled = () => {
+  if (
+    process.env.DISABLE_LISTENBRAINZ_FLOWS === "1" ||
+    process.env.DISABLE_LISTENBRAINZ_FLOWS === "true"
+  ) {
+    return false;
+  }
+  return true;
+};
 
 const LISTENBRAINZ_SITEWIDE_POOL_CACHE = createCache(6 * 60 * 60);
 const LISTENBRAINZ_ENRICHED_POOL_CACHE = createCache(6 * 60 * 60);
@@ -615,10 +642,14 @@ export const searchFallbackGenreArtists = async ({
   };
 };
 
-export const getDiscoveryCapabilities = (hasLastfmKey = !!getLastfmApiKey()) => {
+export const getDiscoveryCapabilities = (
+  hasLastfmKey = !!getLastfmApiKey(),
+  hasListenbrainzHistory = false,
+) => {
   const full = !!hasLastfmKey;
+  const personalized = full || !!hasListenbrainzHistory;
   return {
-    personalizedRecommendations: full,
+    personalizedRecommendations: personalized,
     globalTrending: true,
     genreSections: true,
     arbitraryTagSearch: full,
@@ -633,15 +664,22 @@ export const getDiscoveryCapabilities = (hasLastfmKey = !!getLastfmApiKey()) => 
 };
 
 export const getFlowCapabilities = (hasLastfmKey = !!getLastfmApiKey()) => {
-  if (hasLastfmKey) {
+  const listenbrainzFlows = isListenbrainzFlowsEnabled();
+  if (hasLastfmKey || listenbrainzFlows) {
     return {
-      lastfmRequired: false,
+      lastfmRequired: !hasLastfmKey && !listenbrainzFlows,
+      listenbrainzBased: !hasLastfmKey && listenbrainzFlows,
+      requiresListeningHistory: true,
+      provider: hasLastfmKey ? "lastfm" : "listenbrainz",
       availableSources: ["discover", "mix", "trending", "focus"],
       unavailableSources: {},
     };
   }
   return {
     lastfmRequired: true,
+    listenbrainzBased: false,
+    requiresListeningHistory: true,
+    provider: "lastfm",
     availableSources: [],
     unavailableSources: {
       discover: "Last.fm API key required",

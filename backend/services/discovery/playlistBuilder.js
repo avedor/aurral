@@ -1,5 +1,8 @@
-import { getLastfmApiKey } from "../apiClients/index.js";
-import { getDiscoveryCache, isDiscoveryPersonalizedEnabled } from "./index.js";
+import {
+  getDiscoveryCache,
+  isDiscoveryEditorialEnabled,
+  isDiscoveryPersonalizedEnabled,
+} from "./index.js";
 import { playlistSource } from "../weeklyFlow/weeklyFlowPlaylistSource.js";
 import { flowPlaylistConfig } from "../weeklyFlow/weeklyFlowPlaylistConfig.js";
 import {
@@ -166,8 +169,6 @@ export async function generateDiscoverPlaylists({
   historyTopArtists = [],
   onProgress,
 } = {}) {
-  if (!getLastfmApiKey()) return [];
-
   const historyArtists = resolveListeningHistoryPreset({ basedOn, historyTopArtists });
 
   const personalizedEnabled = isDiscoveryPersonalizedEnabled();
@@ -226,13 +227,15 @@ export async function generateDiscoverPlaylists({
     }
   }
 
-  let editorialPlaylists = [];
-  try {
-    editorialPlaylists = await generateEditorialPlaylists();
-  } catch (error) {
-    console.warn(`[DiscoverPlaylists] Editorial playlists failed: ${error.message}`);
+  if (isDiscoveryEditorialEnabled()) {
+    let editorialPlaylists = [];
+    try {
+      editorialPlaylists = await generateEditorialPlaylists();
+    } catch (error) {
+      console.warn(`[DiscoverPlaylists] Editorial playlists failed: ${error.message}`);
+    }
+    playlists.push(...editorialPlaylists);
   }
-  playlists.push(...editorialPlaylists);
 
   onProgress?.({ completed: totalSteps, total: totalSteps });
 

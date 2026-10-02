@@ -1,5 +1,4 @@
 import { dbOps } from "../../db/helpers/index.js";
-import { getLastfmApiKey } from "../apiClients/index.js";
 import { iterateCanonicalArtistProjection } from "../libraryQueryService.js";
 import { logger } from "../logger.js";
 import { buildExistingArtistKeySet } from "./recommendationPipeline.js";
@@ -60,9 +59,6 @@ export const runQueuedDiscoverPlaylistBuild = async (payload = {}) => {
   const activeToken = getDiscoveryPlaylistBuildToken(buildKey);
   if (activeToken && buildToken && activeToken !== buildToken) {
     return { skipped: true, reason: "stale_build" };
-  }
-  if (!getLastfmApiKey()) {
-    return { skipped: true, reason: "lastfm_not_configured" };
   }
 
   return withHonkerLock(

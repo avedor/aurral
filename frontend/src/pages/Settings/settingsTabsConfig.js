@@ -246,6 +246,7 @@ const SETTINGS_SEARCH_METADATA = {
       "Discovery mode": "safer balanced deeper recommendations",
       "Recommended artists": "number per refresh",
       "Recommended playlists": "Discover Weekly Trending Mix Library Blend Listening History Release Radar",
+      "Editorial playlists": "curated genre mood era shelves Top Rock Indie Chill 90s",
       "Refresh discovery": "update recommendations now",
       "Clear artwork cache": "stored artwork links native library image files reset",
       Provider: "Last.fm ListenBrainz fallback",

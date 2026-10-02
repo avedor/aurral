@@ -185,22 +185,22 @@ export default function DiscoverPlaylistsPage() {
             <h2 className="search-empty-panel__title">Something went wrong</h2>
             <p className="search-empty-panel__message">{error}</p>
           </div>
-        ) : !lastfmConfigured ? (
-          <div className="search-empty-panel">
-            <div className="search-empty-panel__icon" aria-hidden="true">
-              <Music className="artist-icon-lg" />
-            </div>
-            <h2 className="search-empty-panel__title">Connect Last.fm</h2>
-            <Link to="/settings/connect" className="btn btn-secondary btn-sm">
-              Open Last.fm settings
-            </Link>
-          </div>
         ) : (
           <div className="search-empty-panel">
             <div className="search-empty-panel__icon" aria-hidden="true">
               <Music className="artist-icon-lg" />
             </div>
             <h2 className="search-empty-panel__title">No playlists yet</h2>
+            <p className="search-empty-panel__message">
+              {lastfmConfigured
+                ? "Refresh discovery to build your recommended playlists."
+                : "Set a listening history provider to build playlists from your plays, or add a Last.fm API key."}
+            </p>
+            {lastfmConfigured ? null : (
+              <Link to="/profile" className="btn btn-secondary btn-sm">
+                Set listening history
+              </Link>
+            )}
             <Link to="/settings/discover" className="btn btn-secondary btn-sm">
               Open Discovery Settings
             </Link>

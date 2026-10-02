@@ -13,8 +13,10 @@ import { getCanonicalArtistKeyProjection } from "../libraryQueryService.js";
 import { userOps } from "../../db/helpers/index.js";
 import {
   DISCOVERY_PROVIDER_LASTFM,
+  DISCOVERY_PROVIDER_LISTENBRAINZ,
   DISCOVERY_PROVIDER_LISTENBRAINZ_FALLBACK,
   getDiscoveryCapabilities,
+  hasListenbrainzHistoryProfile,
 } from "../listenbrainzDiscoveryFallback.js";
 import {
   getListenHistoryCacheNamespace,
@@ -46,7 +48,7 @@ export async function getUserDiscovery(userId, limit = 50, offset = 0) {
       : externalListenHistoryProfile;
   const userCacheNamespace =
     getListenHistoryCacheNamespace(listenHistoryProfile);
-  const effectiveCacheNamespace = hasLastfmKey ? userCacheNamespace : null;
+  const effectiveCacheNamespace = userCacheNamespace;
 
   const discoveryCache = getDiscoveryCache(effectiveCacheNamespace);
   const isUpdating = discoveryCache.isUpdating || false;
@@ -69,10 +71,26 @@ export async function getUserDiscovery(userId, limit = 50, offset = 0) {
     provider,
     capabilities,
   } = discoveryCache;
-  provider = hasLastfmKey
-    ? DISCOVERY_PROVIDER_LASTFM
-    : provider || DISCOVERY_PROVIDER_LISTENBRAINZ_FALLBACK;
-  capabilities = capabilities || getDiscoveryCapabilities(hasLastfmKey);
+  const listenbrainzHistoryConfigured = hasListenbrainzHistoryProfile();
+  if (hasLastfmKey) {
+    provider = DISCOVERY_PROVIDER_LASTFM;
+  } else if (
+    !provider ||
+    (provider === DISCOVERY_PROVIDER_LISTENBRAINZ_FALLBACK &&
+      listenbrainzHistoryConfigured)
+  ) {
+    // Without a Last.fm key the only personalized sources are a ListenBrainz
+    // history profile, so the fallback becomes real personalization.
+    provider = listenbrainzHistoryConfigured
+      ? DISCOVERY_PROVIDER_LISTENBRAINZ
+      : DISCOVERY_PROVIDER_LISTENBRAINZ_FALLBACK;
+  }
+  // Capabilities are purely derived from the provider, so recompute them here
+  // rather than trusting a cached copy that predates the provider above.
+  capabilities = getDiscoveryCapabilities(
+    hasLastfmKey || provider === DISCOVERY_PROVIDER_LASTFM,
+    listenbrainzHistoryConfigured || provider === DISCOVERY_PROVIDER_LISTENBRAINZ,
+  );
   const feedback = getDiscoveryFeedback(userId || "global");
   const blockedKeys = getBlockedArtistKeys(userId || "global", feedback);
   const discoveryMode = getDiscoveryMode();
@@ -178,6 +196,7 @@ export async function getUserDiscovery(userId, limit = 50, offset = 0) {
       provider,
       capabilities,
       discoveryMode,
+      listenbrainzHistoryConfigured: listenbrainzHistoryConfigured,
     },
   };
 }
