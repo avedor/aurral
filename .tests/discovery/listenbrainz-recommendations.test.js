@@ -378,9 +378,11 @@ test("editorial playlists build from listenbrainz tags without a lastfm key", as
   const tagTimeouts = [];
   mockListenbrainzOnly(t, async (url, options) => {
     const target = String(url);
-    if (target.includes("/recording/")) {
-      const requested = target.split("/recording/")[1]?.split("?")[0] || "";
-      const ids = requested.split(";");
+    // Recording metadata is fetched by Lucene search on rid:, not a semicolon
+    // path lookup, so match the query param rather than the URL path.
+    const ridQuery = String(options?.params?.query || "");
+    if (ridQuery.startsWith("rid:")) {
+      const ids = [...ridQuery.matchAll(/\(([0-9a-f-]{36})\)/gi)].map((m) => m[1].toLowerCase());
       return {
         status: 200,
         data: {

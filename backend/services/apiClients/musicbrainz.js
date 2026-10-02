@@ -40,6 +40,8 @@ const SECONDARY_RELEASE_TYPES = [
 ];
 
 const mbLimiter = createRateLimiter(1000);
+// MusicBrainz caps Lucene query length, so recording batches stay modest.
+const RECORDING_LOOKUP_BATCH_SIZE = 10;
 
 export const musicbrainzRequest = async (endpoint, params = {}) =>
   legacyMusicbrainzRequest(endpoint, params);
@@ -107,20 +109,25 @@ export async function musicbrainzGetRecordingsByIds(mbids, { signal } = {}) {
     const contact =
       (getMusicBrainzContact() || "").trim() || "https://github.com/aurral";
     const userAgent = `${APP_NAME}/${APP_VERSION} ( ${contact} )`;
-    for (let offset = 0; offset < missing.length; offset += 20) {
-      const batch = missing.slice(offset, offset + 20);
+    for (let offset = 0; offset < missing.length; offset += RECORDING_LOOKUP_BATCH_SIZE) {
+      const batch = missing.slice(offset, offset + RECORDING_LOOKUP_BATCH_SIZE);
       try {
         const response = await mbLimiter.schedule(async () => {
           signal?.throwIfAborted?.();
-          return axios.get(
-            `${MUSICBRAINZ_API}/recording/${batch.join(";")}`,
-            {
-              params: { fmt: "json", inc: "artist-credits+releases" },
-              headers: { "User-Agent": userAgent },
-              timeout: 12000,
-              signal,
+          // MusicBrainz rejects semicolon-batched path lookups on /recording/
+          // with 400 "Invalid mbid.", so batched lookups use Lucene search on
+          // the recording ids instead.
+          return axios.get(`${MUSICBRAINZ_API}/recording`, {
+            params: {
+              query: `rid:(${batch.map((mbid) => `(${mbid})`).join(" OR ")})`,
+              fmt: "json",
+              inc: "artist-credits+releases",
+              limit: batch.length,
             },
-          );
+            headers: { "User-Agent": userAgent },
+            timeout: 12000,
+            signal,
+          });
         });
         const recordings = Array.isArray(response?.data?.recordings)
           ? response.data.recordings
