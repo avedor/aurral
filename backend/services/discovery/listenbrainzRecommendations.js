@@ -20,6 +20,33 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const toMatchScore = (listenCount) =>
   clamp(Math.log10(Math.max(0, Number(listenCount) || 0) + 1) / 7, 0.05, 1);
 
+/**
+ * LB Radio returns a bare dict keyed by similar artist MBID, where each value
+ * is an array of recording entries:
+ *   { "<artist_mbid>": [{ recording_mbid, similar_artist_mbid,
+ *                          similar_artist_name, total_listen_count }] }
+ *
+ * Unlike the weekly-flow flattener this keeps entries whose recording_mbid is
+ * missing or malformed: recommendations only need the artist, so filtering on
+ * recording validity here would silently drop artists.
+ */
+const flattenRadioArtistEntries = (radio) => {
+  const entries = [];
+  if (!radio || typeof radio !== "object" || Array.isArray(radio)) return entries;
+  for (const [key, list] of Object.entries(radio)) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      entries.push({
+        artistMbid: String(item.similar_artist_mbid || "").trim(),
+        artistName: String(item.similar_artist_name || "").trim() || key.trim(),
+        listenCount: Number(item.total_listen_count ?? item.listen_count ?? 0),
+      });
+    }
+  }
+  return entries;
+};
+
 export const fetchListenbrainzSimilarArtists = async (
   seed,
   maxSimilarArtists = 25,
@@ -32,23 +59,28 @@ export const fetchListenbrainzSimilarArtists = async (
   }
   const limit = Math.max(1, Math.min(100, Math.floor(Number(maxSimilarArtists) || 25)));
   try {
+    // pop_begin/pop_end are mandatory: omitting either returns
+    // 400 "pop_begin param is missing". They bound the popularity percentile of
+    // the candidate recordings (0 = obscure, 100 = most played).
     const data = await listenbrainzRequest(
       `/1/lb-radio/artist/${encodeURIComponent(seedMbid)}`,
       {
         mode: "medium",
         max_similar_artists: limit,
         max_recordings_per_artist: 1,
+        pop_begin: 0,
+        pop_end: 100,
       },
     );
     if (lastfmHealth) lastfmHealth.success++;
-    const entries = Array.isArray(data?.payload?.artists) ? data.payload.artists : [];
+    const entries = flattenRadioArtistEntries(data);
     const byArtist = new Map();
     for (const entry of entries) {
-      const similarMbid = normalizeMbid(entry?.similar_artist_mbid);
-      const name = String(entry?.similar_artist_name || "").trim();
+      const similarMbid = normalizeMbid(entry?.artistMbid);
+      const name = String(entry?.artistName || "").trim();
       if (!similarMbid && !name) continue;
       if (similarMbid === seedMbid) continue;
-      const listenCount = Math.max(0, Number(entry?.total_listen_count) || 0);
+      const listenCount = Math.max(0, Number(entry?.listenCount) || 0);
       const key = similarMbid || `name:${name.toLowerCase()}`;
       const existing = byArtist.get(key);
       if (existing) {

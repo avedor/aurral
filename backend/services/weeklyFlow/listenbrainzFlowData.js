@@ -3,6 +3,7 @@ import {
   musicbrainzGetCachedArtistMbidByName,
   musicbrainzResolveArtistMbidByName,
   musicbrainzGetRecordingsByIds,
+  LISTENBRAINZ_SLOW_ENDPOINT_TIMEOUT_MS,
 } from "../apiClients/index.js";
 
 const LB_RADIO_DEFAULT_MODE = "easy";
@@ -82,13 +83,20 @@ export async function fetchListenbrainzTagTracks({
   const safeTag = String(tag || "").trim();
   if (!safeTag) return [];
   const safeCount = Math.min(1000, Math.max(1, Number(count) || 50));
-  const data = await listenbrainzRequest("/1/lb-radio/tags", {
-    tag: safeTag,
-    count: safeCount,
-    operator: String(operator || "OR").trim().toUpperCase() === "AND" ? "AND" : "OR",
-    pop_begin: Math.max(0, Number(popBegin) || 0),
-    pop_end: Math.min(100, Math.max(0, Number(popEnd) ?? 100) || 100),
-  }).catch(() => null);
+  // This endpoint is far slower than the rest of the LB API (measured 5-30s for
+  // common tags), so it needs a longer timeout. Retries are capped at 1 because a
+  // timeout here usually means "slow", not "flaky".
+  const data = await listenbrainzRequest(
+    "/1/lb-radio/tags",
+    {
+      tag: safeTag,
+      count: safeCount,
+      operator: String(operator || "OR").trim().toUpperCase() === "AND" ? "AND" : "OR",
+      pop_begin: Math.max(0, Number(popBegin) || 0),
+      pop_end: Math.min(100, Math.max(0, Number(popEnd) ?? 100) || 100),
+    },
+    { timeoutMs: LISTENBRAINZ_SLOW_ENDPOINT_TIMEOUT_MS, maxRetries: 1 },
+  ).catch(() => null);
   return Array.isArray(data) ? data : [];
 }
 

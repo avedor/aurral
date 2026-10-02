@@ -10,6 +10,9 @@ const listenbrainzLimiter = createRateLimiter(250);
 
 const LISTENBRAINZ_TIMEOUT_MS = 6000;
 const LISTENBRAINZ_MAX_RETRIES = 2;
+// LB Radio's tag endpoint routinely takes 5-30s, far beyond the default
+// timeout, so callers must be able to opt into a longer budget per request.
+export const LISTENBRAINZ_SLOW_ENDPOINT_TIMEOUT_MS = 45000;
 
 const listenbrainzInflightRequests = new Map();
 const listenbrainzErrorLogAt = new Map();
@@ -82,7 +85,12 @@ export const listenbrainzSubmit = async ({ token, baseUrl = LISTENBRAINZ_API, ev
 export async function listenbrainzRequest(
   path,
   params = {},
-  { token = null, baseUrl = LISTENBRAINZ_API } = {},
+  {
+    token = null,
+    baseUrl = LISTENBRAINZ_API,
+    timeoutMs = LISTENBRAINZ_TIMEOUT_MS,
+    maxRetries = LISTENBRAINZ_MAX_RETRIES,
+  } = {},
 ) {
   const root = normalizeListenbrainzBaseUrl(baseUrl);
   const isAuthenticated = Boolean(String(token || "").trim());
@@ -121,7 +129,7 @@ export async function listenbrainzRequest(
     let lastError = null;
     for (
       let retryCount = 0;
-      retryCount <= LISTENBRAINZ_MAX_RETRIES;
+      retryCount <= maxRetries;
       retryCount++
     ) {
       try {
@@ -131,7 +139,7 @@ export async function listenbrainzRequest(
             ...(isAuthenticated
               ? { headers: { Authorization: `Token ${String(token).trim()}` } }
               : {}),
-            timeout: LISTENBRAINZ_TIMEOUT_MS,
+            timeout: timeoutMs,
             validateStatus: (status) =>
               (status >= 200 && status < 300) || status === 204,
           }),
@@ -141,7 +149,7 @@ export async function listenbrainzRequest(
         return payload;
       } catch (error) {
         lastError = error;
-        if (retryCount < LISTENBRAINZ_MAX_RETRIES && isRetryable(error)) {
+        if (retryCount < maxRetries && isRetryable(error)) {
           const backoffMs = 300 * Math.pow(2, retryCount) + retryCount * 200;
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
           continue;

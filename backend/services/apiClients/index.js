@@ -31,6 +31,7 @@ export {
   listenbrainzRequest,
   listenbrainzSubmit,
   listenbrainzValidateToken,
+  LISTENBRAINZ_SLOW_ENDPOINT_TIMEOUT_MS,
 } from "./listenbrainz.js";
 
 export {

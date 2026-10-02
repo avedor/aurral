@@ -83,41 +83,47 @@ test.beforeEach(() => {
 test.after(() => cleanupIsolatedState(state));
 
 test("listenbrainz similar artists are mapped, aggregated, and exclude the seed artist", async (t) => {
-  mockListenbrainzOnly(t, async () => ({
-    status: 200,
-    data: {
-      payload: {
-        mbid: SEED_MBID,
-        name: "Seed Artist",
-        artists: [
+  const seenParams = [];
+  // Real LB Radio shape: a bare dict keyed by similar artist MBID, values are
+  // arrays of recording entries. Not a { payload: { artists } } envelope.
+  mockListenbrainzOnly(t, async (_url, options) => {
+    seenParams.push(options?.params || {});
+    return {
+      status: 200,
+      data: {
+        [SEED_MBID]: [
           {
-            recording_mbid: "rec-1",
+            recording_mbid: "11111111-1111-4111-8111-111111111111",
             similar_artist_mbid: SEED_MBID,
             similar_artist_name: "Seed Artist",
             total_listen_count: 500000,
           },
+        ],
+        [SIMILAR_MBID]: [
           {
-            recording_mbid: "rec-2",
+            recording_mbid: "22222222-2222-4222-8222-222222222222",
             similar_artist_mbid: SIMILAR_MBID,
             similar_artist_name: "Similar Artist",
             total_listen_count: 12000,
           },
           {
-            recording_mbid: "rec-3",
+            recording_mbid: "33333333-3333-4333-8333-333333333333",
             similar_artist_mbid: SIMILAR_MBID,
             similar_artist_name: "Similar Artist",
             total_listen_count: 8000,
           },
+        ],
+        [SIMILAR_MBID_2]: [
           {
-            recording_mbid: "rec-4",
+            recording_mbid: "44444444-4444-4444-8444-444444444444",
             similar_artist_mbid: SIMILAR_MBID_2,
             similar_artist_name: "Another Artist",
             total_listen_count: 30000000,
           },
         ],
       },
-    },
-  }));
+    };
+  });
 
   const health = { success: 0, failure: 0 };
   const artists = await fetchListenbrainzSimilarArtists(
@@ -126,6 +132,10 @@ test("listenbrainz similar artists are mapped, aggregated, and exclude the seed 
     health,
   );
 
+  // LB Radio rejects the request with 400 when either bound is missing.
+  assert.equal(seenParams.length, 1, "expected one lb-radio request");
+  assert.equal(seenParams[0].pop_begin, 0, "pop_begin must be sent");
+  assert.equal(seenParams[0].pop_end, 100, "pop_end must be sent");
   assert.equal(health.success, 1);
   assert.equal(artists.length, 2);
   assert.equal(artists[0].name, "Another Artist");
@@ -218,25 +228,23 @@ test("collectListenbrainzSeedTags builds a tag map and weights", async () => {
 });
 
 test("buildRecommendationsFromSeeds generates listenbrainz recommendations without lastfm", async (t) => {
-  mockListenbrainzOnly(t, async (url) => {
+  const radioCalls = [];
+  mockListenbrainzOnly(t, async (url, options) => {
     const seedMbid = String(url).split("/artist/")[1]?.split("?")[0] || "";
+    radioCalls.push({ seedMbid, params: options?.params || {} });
     const similarMbid = seedMbid === SEED_MBID ? SIMILAR_MBID : SIMILAR_MBID_2;
     const similarName = seedMbid === SEED_MBID ? "Similar Artist" : "Another Artist";
     return {
       status: 200,
       data: {
-        payload: {
-          mbid: seedMbid,
-          name: "Seed",
-          artists: [
-            {
-              recording_mbid: `rec-${seedMbid}`,
-              similar_artist_mbid: similarMbid,
-              similar_artist_name: similarName,
-              total_listen_count: 40000,
-            },
-          ],
-        },
+        [similarMbid]: [
+          {
+            recording_mbid: "55555555-5555-4555-8555-555555555555",
+            similar_artist_mbid: similarMbid,
+            similar_artist_name: similarName,
+            total_listen_count: 40000,
+          },
+        ],
       },
     };
   });
@@ -282,6 +290,15 @@ test("buildRecommendationsFromSeeds generates listenbrainz recommendations witho
     assert.ok(names.includes("Another Artist"), names.join(", "));
     assert.ok(recommendations.every((artist) => artist.sourceType === "listenbrainz"));
     assert.ok(recommendations.every((artist) => artist.tags.includes("indie rock")));
+    // Every seed must reach LB Radio with the mandatory popularity bounds,
+    // otherwise the endpoint 400s and contributes no recommendations at all.
+    assert.equal(radioCalls.length, 2, "expected one radio call per seed");
+    assert.ok(
+      radioCalls.every(
+        (call) => call.params.pop_begin === 0 && call.params.pop_end === 100,
+      ),
+      JSON.stringify(radioCalls),
+    );
   } finally {
     dbOps.updateSettings(previousSettings);
     clearMetadataProviderCaches();
@@ -325,7 +342,8 @@ test("editorial playlists build from listenbrainz tags without a lastfm key", as
   const recB = "1b1b1b1b-0002-4b1b-8b1b-1b1b1b1b1b02";
   const releaseMbid = "1c1c1c1c-0003-4c1c-8c1c-1c1c1c1c1c03";
 
-  mockListenbrainzOnly(t, async (url) => {
+  const tagTimeouts = [];
+  mockListenbrainzOnly(t, async (url, options) => {
     const target = String(url);
     if (target.includes("/recording/")) {
       const requested = target.split("/recording/")[1]?.split("?")[0] || "";
@@ -346,6 +364,7 @@ test("editorial playlists build from listenbrainz tags without a lastfm key", as
       };
     }
     assert.match(target, /\/1\/lb-radio\/tags/);
+    tagTimeouts.push(options?.timeout);
     return {
       status: 200,
       data: [
@@ -371,6 +390,13 @@ test("editorial playlists build from listenbrainz tags without a lastfm key", as
   assert.equal(playlist.tracks[0].albumName, "Tag Album");
   // Reason copy must not claim a Last.fm ranking.
   assert.doesNotMatch(playlist.tracks[0].reason, /Last\.fm/);
+  // The LB tag endpoint regularly takes 5-30s, so it must not inherit the
+  // 6s default timeout or every editorial playlist comes back empty.
+  assert.ok(tagTimeouts.length > 0, "expected at least one tag request");
+  assert.ok(
+    tagTimeouts.every((timeout) => timeout >= 30000),
+    `tag timeout too small: ${JSON.stringify(tagTimeouts)}`,
+  );
 });
 
 test("global refresh on the listenbrainz path does not hit a temporal dead zone", async (t) => {
@@ -448,18 +474,14 @@ test("global refresh on the listenbrainz path does not hit a temporal dead zone"
       return {
         status: 200,
         data: {
-          payload: {
-            mbid: seedMbid,
-            name: "Seed Artist",
-            artists: [
-              {
-                recording_mbid: recMbid,
-                similar_artist_mbid: similarMbid,
-                similar_artist_name: "Radio Artist",
-                total_listen_count: 12000,
-              },
-            ],
-          },
+          [similarMbid]: [
+            {
+              recording_mbid: recMbid,
+              similar_artist_mbid: similarMbid,
+              similar_artist_name: "Radio Artist",
+              total_listen_count: 12000,
+            },
+          ],
         },
       };
     }
