@@ -158,6 +158,39 @@ test("listenbrainz similar artists returns empty without an mbid", async () => {
   assert.equal(health.failure, 1);
 });
 
+test("listenbrainz requests retry after a 429 and honour the rate limit reset", async (t) => {
+  let attempts = 0;
+  mockListenbrainzOnly(t, async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      // ListenBrainz answers 429 once the 30/minute window is exhausted and
+      // reports when that window resets.
+      throw Object.assign(new Error("Request failed with status code 429"), {
+        response: {
+          status: 429,
+          data: { error: "You have exceeded your rate limit." },
+          headers: {
+            "x-ratelimit-reset": String(
+              Math.floor(Date.now() / 1000) + 1,
+            ),
+          },
+        },
+      });
+    }
+    return { status: 200, data: { ok: true } };
+  });
+
+  const { listenbrainzRequest } = await importFromRepo(
+    "backend/services/apiClients/listenbrainz.js",
+  );
+  const result = await listenbrainzRequest("/1/test-retry-after-429", {
+    unique: "429-retry",
+  });
+
+  assert.equal(attempts, 2, "expected the 429 to be retried");
+  assert.deepEqual(result, { ok: true });
+});
+
 test("listenbrainz similar users are parsed and sorted", async (t) => {
   mockListenbrainzOnly(t, async () => ({
     status: 200,
@@ -510,4 +543,111 @@ test("global refresh on the listenbrainz path does not hit a temporal dead zone"
     "expected listenbrainz recommendations from the history profile",
   );
   assert.ok(cached.lastUpdated, "expected a refresh timestamp");
+});
+
+test("global refresh schedules the discover playlist build on the listenbrainz path", async (t) => {
+  const seedMbid = "7a7a7a7a-1111-4111-8111-111111111111";
+  const similarMbid = "7b7b7b7b-2222-4222-8222-222222222222";
+  const recMbid = "7c7c7c7c-3333-4333-8333-333333333333";
+  const releaseMbid = "7d7d7d7d-4444-4444-8444-444444444444";
+
+  db.prepare(
+    `INSERT INTO users (username, password_hash, role, listen_history_provider, listen_history_username)
+     VALUES ('lb-playlist', 'hash', 'user', 'listenbrainz', 'lb-listener')`,
+  ).run();
+
+  // Keep the queued job from being claimed by an in-process worker so the
+  // assertion is deterministic.
+  const previousGroup = process.env.AURRAL_BACKGROUND_WORKER_GROUP;
+  process.env.AURRAL_BACKGROUND_WORKER_GROUP = "flow";
+
+  const server = await createMockHttpServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+    if (request.url?.includes("/recording/")) {
+      response.end(
+        JSON.stringify({
+          recordings: [
+            {
+              id: recMbid,
+              title: "Radio Track",
+              "artist-credit": [{ name: "Radio Artist", artist: { id: similarMbid } }],
+              releases: [{ id: releaseMbid, title: "Radio Album", date: "2024-01-02" }],
+              length: 180000,
+            },
+          ],
+        }),
+      );
+      return;
+    }
+    const mbid = String(request.url || "").split("/").pop() || "";
+    response.end(JSON.stringify({ id: mbid, name: "Seed", genres: ["indie rock"] }));
+  });
+  const previousSettings = pointMetadataProviderAt(server.url);
+  clearMetadataProviderCaches();
+
+  t.after(async () => {
+    if (previousGroup === undefined) {
+      delete process.env.AURRAL_BACKGROUND_WORKER_GROUP;
+    } else {
+      process.env.AURRAL_BACKGROUND_WORKER_GROUP = previousGroup;
+    }
+    dbOps.updateSettings(previousSettings);
+    clearMetadataProviderCaches();
+    await server.close();
+  });
+
+  mockListenbrainzOnly(t, async (url) => {
+    const target = String(url);
+    if (target.includes("/1/stats/user/")) {
+      return {
+        status: 200,
+        data: {
+          payload: {
+            artists: [
+              { artist_name: "Seed Artist", artist_mbids: [seedMbid], listen_count: 5000 },
+            ],
+          },
+        },
+      };
+    }
+    if (target.includes("/1/lb-radio/artist/")) {
+      return {
+        status: 200,
+        data: {
+          [similarMbid]: [
+            {
+              recording_mbid: recMbid,
+              similar_artist_mbid: similarMbid,
+              similar_artist_name: "Radio Artist",
+              total_listen_count: 12000,
+            },
+          ],
+        },
+      };
+    }
+    return { status: 200, data: [] };
+  });
+
+  const { updateDiscoveryCache } = await importFromRepo(
+    "backend/services/discovery/provider.js",
+  );
+  const { listHonkerJobs } = await importFromRepo("backend/services/honkerDb.js");
+
+  const beforeCount = listHonkerJobs("discovery-playlist-build").length;
+
+  // The ListenBrainz branch returns before the shared tail that enqueues the
+  // playlist build, so it has to enqueue one itself. Without it, Discover
+  // playlists stay permanently empty for ListenBrainz-only users.
+  await updateDiscoveryCache({ skipHonkerLock: true });
+
+  const queued = listHonkerJobs("discovery-playlist-build");
+  assert.equal(
+    queued.length,
+    beforeCount + 1,
+    "expected the discover playlist build to be enqueued",
+  );
+  assert.ok(
+    queued[queued.length - 1].payload?.buildToken,
+    "expected a build token on the job",
+  );
 });

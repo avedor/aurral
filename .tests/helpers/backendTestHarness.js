@@ -63,6 +63,9 @@ export function applyIsolatedBackendEnv(paths) {
   process.env.DOWNLOAD_FOLDER = join(paths.baseDir, "downloads");
   process.env.NODE_ENV = "test";
   process.env.JSON_BODY_LIMIT = "2mb";
+  // ListenBrainz allows 30 requests/minute and the client paces itself to
+  // match. Mocked calls do not need that pacing and would make the suite crawl.
+  process.env.AURRAL_LISTENBRAINZ_RATE_LIMIT_MS = "0";
 }
 
 export async function cleanupIsolatedState(paths) {

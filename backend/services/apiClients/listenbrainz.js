@@ -6,7 +6,17 @@ import { LISTENBRAINZ_API } from "../../config/constants.js";
 
 const listenbrainzCache = createCache(300);
 
-const listenbrainzLimiter = createRateLimiter(250);
+// ListenBrainz allows 30 requests per rolling 60s window for unauthenticated
+// callers and answers with 429 once that is exceeded. Every LB call in the
+// process shares this one limiter, so pacing here paces the whole budget.
+const resolveRateLimitIntervalMs = () => {
+  const override = Number(process.env.AURRAL_LISTENBRAINZ_RATE_LIMIT_MS);
+  return Number.isFinite(override) && override >= 0
+    ? override
+    : 2000;
+};
+
+const listenbrainzLimiter = createRateLimiter(resolveRateLimitIntervalMs());
 
 const LISTENBRAINZ_TIMEOUT_MS = 6000;
 const LISTENBRAINZ_MAX_RETRIES = 2;
@@ -112,8 +122,21 @@ export async function listenbrainzRequest(
         code === "ECONNRESET" ||
         code === "ENOTFOUND" ||
         code === "EAI_AGAIN" ||
-        [408, 425, 500, 502, 503, 504].includes(status)
+        [408, 425, 429, 500, 502, 503, 504].includes(status)
       );
+    };
+    // On 429 the server tells us when the window resets; waiting that long beats
+    // burning retries on a fixed short backoff.
+    const rateLimitWaitMs = (error) => {
+      if (error?.response?.status !== 429) return null;
+      const headers = error.response?.headers || {};
+      const resetAt = Number(
+        headers["x-ratelimit-reset"] ?? headers.get?.("x-ratelimit-reset"),
+      );
+      if (!Number.isFinite(resetAt) || resetAt <= 0) return null;
+      const waitMs = resetAt * 1000 - Date.now();
+      if (waitMs <= 0) return null;
+      return Math.min(65000, Math.max(1000, waitMs + 500));
     };
     const getLogKey = (details) =>
       `${details.path}:${details.status || "none"}:${details.code || "none"}`;
@@ -150,7 +173,9 @@ export async function listenbrainzRequest(
       } catch (error) {
         lastError = error;
         if (retryCount < maxRetries && isRetryable(error)) {
-          const backoffMs = 300 * Math.pow(2, retryCount) + retryCount * 200;
+          const backoffMs =
+            rateLimitWaitMs(error) ??
+            300 * Math.pow(2, retryCount) + retryCount * 200;
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
           continue;
         }

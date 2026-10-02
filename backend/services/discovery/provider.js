@@ -493,6 +493,7 @@ export const updateDiscoveryCache = async (options = {}) => {
             profile.listenHistoryProvider === "listenbrainz" &&
             Boolean(profile.listenHistoryUsername),
         );
+      const listenbrainzTopArtists = [];
       if (listenbrainzProfiles.length > 0) {
         logger.info(
           'discovery',
@@ -516,6 +517,7 @@ export const updateDiscoveryCache = async (options = {}) => {
             if (seenHistoryKeys.has(key)) continue;
             seenHistoryKeys.add(key);
             historyArtists.push({ ...artist, source: "listenbrainz" });
+            listenbrainzTopArtists.push(artist.artistName);
           }
         }
         const seeds = buildDiscoverySeedList({
@@ -603,6 +605,26 @@ export const updateDiscoveryCache = async (options = {}) => {
         recommendationCount: fallbackData.recommendations?.length || 0,
         genreCount: fallbackData.topGenres?.length || 0,
       });
+      // This branch returns before the shared tail that schedules the playlist
+      // build, so Discover playlists have to be enqueued here too.
+      scheduleDiscoverPlaylistBuild({
+        historyTopArtists: listenbrainzTopArtists.slice(0, 3).filter(Boolean),
+        progressExtra: {
+          recommendations: fallbackData.recommendations || [],
+          globalTop: fallbackData.globalTop || [],
+          basedOn: fallbackData.basedOn || [],
+          topTags: fallbackData.topTags || [],
+          topGenres: fallbackData.topGenres || [],
+          fallbackGenres: fallbackData.fallbackGenres || [],
+          discoverPlaylists: discoveryCache.discoverPlaylists || [],
+          provider: fallbackData.provider || DISCOVERY_PROVIDER_LISTENBRAINZ,
+          lastUpdated: fallbackData.lastUpdated,
+        },
+      });
+      logger.info(
+        'discovery',
+        "Global refresh complete. Starting playlist build.",
+      );
       return;
     }
 
