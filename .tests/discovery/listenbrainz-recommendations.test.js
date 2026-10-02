@@ -372,3 +372,120 @@ test("editorial playlists build from listenbrainz tags without a lastfm key", as
   // Reason copy must not claim a Last.fm ranking.
   assert.doesNotMatch(playlist.tracks[0].reason, /Last\.fm/);
 });
+
+test("global refresh on the listenbrainz path does not hit a temporal dead zone", async (t) => {
+  const seedMbid = "9a9a9a9a-1111-4111-8111-111111111111";
+  const similarMbid = "9b9b9b9b-2222-4222-8222-222222222222";
+  const recMbid = "9c9c9c9c-3333-4333-8333-333333333333";
+  const releaseMbid = "9d9d9d9d-4444-4444-8444-444444444444";
+
+  db.prepare(
+    `INSERT INTO users (username, password_hash, role, listen_history_provider, listen_history_username)
+     VALUES ('lb-refresh', 'hash', 'user', 'listenbrainz', 'lb-listener')`,
+  ).run();
+
+  const server = await createMockHttpServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+    if (request.url?.includes("/recording/")) {
+      response.end(
+        JSON.stringify({
+          recordings: [
+            {
+              id: recMbid,
+              title: "Radio Track",
+              "artist-credit": [{ name: "Radio Artist", artist: { id: similarMbid } }],
+              releases: [{ id: releaseMbid, title: "Radio Album", date: "2024-01-02" }],
+              length: 180000,
+            },
+          ],
+        }),
+      );
+      return;
+    }
+    const mbid = String(request.url || "").split("/").pop() || "";
+    response.end(JSON.stringify({ id: mbid, name: "Seed", genres: ["indie rock"] }));
+  });
+  const previousSettings = pointMetadataProviderAt(server.url);
+  clearMetadataProviderCaches();
+
+  t.after(async () => {
+    dbOps.updateSettings(previousSettings);
+    clearMetadataProviderCaches();
+    await server.close();
+  });
+
+  mockListenbrainzOnly(t, async (url) => {
+    const target = String(url);
+    if (target.includes("/1/stats/user/")) {
+      return {
+        status: 200,
+        data: {
+          payload: {
+            artists: [
+              {
+                artist_name: "Seed Artist",
+                artist_mbids: [seedMbid],
+                listen_count: 5000,
+              },
+            ],
+          },
+        },
+      };
+    }
+    if (target.includes("/1/stats/sitewide/artists")) {
+      return {
+        status: 200,
+        data: {
+          payload: {
+            artists: [
+              { artist_name: "Trending One", artist_mbids: [similarMbid], listen_count: 900 },
+            ],
+          },
+        },
+      };
+    }
+    if (target.includes("/1/lb-radio/artist/")) {
+      return {
+        status: 200,
+        data: {
+          payload: {
+            mbid: seedMbid,
+            name: "Seed Artist",
+            artists: [
+              {
+                recording_mbid: recMbid,
+                similar_artist_mbid: similarMbid,
+                similar_artist_name: "Radio Artist",
+                total_listen_count: 12000,
+              },
+            ],
+          },
+        },
+      };
+    }
+    return { status: 200, data: [] };
+  });
+
+  const { updateDiscoveryCache } = await importFromRepo(
+    "backend/services/discovery/provider.js",
+  );
+
+  // This is the exact production path that crashed with
+  // "Cannot access 'existingArtistKeys' before initialization": the
+  // ListenBrainz branch reads existingArtistKeys before its declaration.
+  // updateDiscoveryCache swallows failures and returns undefined, so assert on
+  // the persisted result rather than on a return value.
+  await updateDiscoveryCache({ skipHonkerLock: true });
+
+  const cached = dbOps.getDiscoveryCache();
+  assert.equal(
+    cached.provider,
+    DISCOVERY_PROVIDER_LISTENBRAINZ,
+    "global refresh should persist the listenbrainz provider",
+  );
+  assert.ok(
+    cached.recommendations.length > 0,
+    "expected listenbrainz recommendations from the history profile",
+  );
+  assert.ok(cached.lastUpdated, "expected a refresh timestamp");
+});

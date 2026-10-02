@@ -460,6 +460,8 @@ export const updateDiscoveryCache = async (options = {}) => {
 
     const hasLastfmKey = !!getLastfmApiKey();
     const lastfmHealth = { success: 0, failure: 0 };
+    // Declared before the ListenBrainz branch below, which references it.
+    const existingArtistKeys = buildExistingArtistKeySet(allLibraryArtists);
 
     if (!hasLastfmKey) {
       logger.info(
@@ -476,7 +478,7 @@ export const updateDiscoveryCache = async (options = {}) => {
         },
       );
       const fallbackData = await buildListenbrainzFallbackDiscovery({
-        existingArtistKeys: buildExistingArtistKeySet(allLibraryArtists),
+        existingArtistKeys,
         onProgress: ({ phase, progress, progressMessage }) =>
           recordDiscoveryUpdateProgress(phase, progressMessage, progress, {
             provider: "listenbrainz-fallback",
@@ -623,7 +625,6 @@ export const updateDiscoveryCache = async (options = {}) => {
       }),
       getLastfmFailureRatio(lastfmHealth),
     ).length;
-    const existingArtistKeys = buildExistingArtistKeySet(allLibraryArtists);
 
     const provisionalSeeds = buildDiscoverySeedList({
       libraryArtists: libraryArtists.map((a) => ({
