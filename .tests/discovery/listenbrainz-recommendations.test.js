@@ -434,6 +434,56 @@ test("editorial playlists build from listenbrainz tags without a lastfm key", as
   );
 });
 
+test("editorial playlists are skipped when the editorial toggle is off", async (t) => {
+  const recA = "2a2a2a2a-0004-4a2a-8a2a-2a2a2a2a2a04";
+  let tagRequests = 0;
+  mockListenbrainzOnly(t, async (url) => {
+    const target = String(url);
+    if (target.includes("/1/lb-radio/tags")) {
+      tagRequests += 1;
+      return { status: 200, data: [{ recording_mbid: recA, total_listen_count: 900 }] };
+    }
+    return { status: 200, data: {} };
+  });
+
+  dbOps.updateSettings({
+    ...dbOps.getSettings(),
+    integrations: {
+      ...(dbOps.getSettings().integrations || {}),
+      lastfm: {
+        ...(dbOps.getSettings().integrations?.lastfm || {}),
+        discoveryEditorialEnabled: false,
+      },
+    },
+  });
+  dbOps.invalidateSettingsCache();
+
+  const { isDiscoveryEditorialEnabled } = await importFromRepo(
+    "backend/services/discovery/helpers.js",
+  );
+  assert.equal(isDiscoveryEditorialEnabled(), false);
+
+  const { generateDiscoverPlaylists } = await importFromRepo(
+    "backend/services/discovery/playlistBuilder.js",
+  );
+  const playlists = await generateDiscoverPlaylists({
+    discoveryCache: { recommendations: [], globalTop: [], basedOn: [], topGenres: [], topTags: [] },
+    basedOn: [],
+    topGenres: [],
+    topTags: [],
+    recommendations: [],
+    globalTop: [],
+    libraryArtists: [],
+    libraryArtistKeys: new Set(),
+  });
+
+  assert.equal(tagRequests, 0, "editorial tag lookups should not run when disabled");
+  assert.ok(
+    playlists.every((playlist) => playlist.type !== "editorial"),
+    "no editorial playlists should be produced",
+  );
+});
+
 test("global refresh on the listenbrainz path does not hit a temporal dead zone", async (t) => {
   const seedMbid = "9a9a9a9a-1111-4111-8111-111111111111";
   const similarMbid = "9b9b9b9b-2222-4222-8222-222222222222";

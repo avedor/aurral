@@ -64,6 +64,10 @@ You can adopt a discover playlist as a flow or as a static playlist. The adopted
 
 Open an editorial playlist to play the Deezer previews for its tracks.
 
+Editorial playlists are curated genre, mood, and era shelves such as Today's Top Rock orAll-Time Indie. They are the same for everyone and do not use your listening history. Turn them on or off under **Settings > Discover > Editorial playlists**.
+
+They are on by default when a Last.fm API key is set, because Last.fm resolves tags in a single request. Without a Last.fm key, Aurral resolves them through ListenBrainz, where each tag lookup can take tens of seconds, so they are off by default to keep refreshes quick. You can turn them on either way; enabling them without a Last.fm key adds several minutes to each discovery refresh.
+
 ## Per-user listening history
 
 Each user chooses a listening-history provider in **Profile > Listening history**. Choose **Local only**, enter a Last.fm or ListenBrainz username, or enter a Koito URL. Aurral always uses the plays recorded in Aurral, and adds history from the selected provider.

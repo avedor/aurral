@@ -6,6 +6,7 @@ export {
   getDiscoveryRecommendationPoolLimit,
   getDiscoveryUserRefreshDelaySeconds,
   isDiscoveryPersonalizedEnabled,
+  isDiscoveryEditorialEnabled,
   DISCOVERY_QUALITY_INITIAL,
   DISCOVERY_QUALITY_ENRICHING,
   DISCOVERY_QUALITY_ENRICHED,

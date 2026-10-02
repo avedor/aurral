@@ -2,6 +2,7 @@
 import { randomUUID } from "crypto";
 import pMap from "p-map";
 import { dbOps } from "../../db/helpers/index.js";
+import { getLastfmApiKey } from "../apiClients/index.js";
 
 export const LASTFM_PERIODS = [
   "none",
@@ -48,6 +49,18 @@ export const isDiscoveryPersonalizedEnabled = () => {
   const value = settings.integrations?.lastfm?.discoveryPersonalizedEnabled;
   if (typeof value === "boolean") return value;
   return true;
+};
+
+// Editorial playlists are identical for every user and, without Last.fm, are
+// the slowest part of a discovery build (ListenBrainz tag lookups take ~40s
+// each). Default them on where they are cheap (Last.fm resolves tags in one
+// call) and off where they are not, so ListenBrainz-only refreshes stay quick
+// unless someone opts in.
+export const isDiscoveryEditorialEnabled = () => {
+  const settings = dbOps.getSettings();
+  const value = settings.integrations?.lastfm?.discoveryEditorialEnabled;
+  if (typeof value === "boolean") return value;
+  return !!getLastfmApiKey();
 };
 
 export const getDiscoveryAutoRefreshHours = () => {

@@ -29,6 +29,10 @@ export const normalizeSettings = (savedSettings) => {
   if (typeof personalizationEnabled !== "boolean") {
     lastfm.discoveryPersonalizedEnabled = true;
   }
+  const editorialEnabled = lastfm.discoveryEditorialEnabled;
+  if (typeof editorialEnabled !== "boolean") {
+    lastfm.discoveryEditorialEnabled = true;
+  }
   const playlistArtwork = savedSettings.playlistArtwork || {};
   const playlistArtworkStyle =
     playlistArtwork.style === "aurral" || lastfm.discoverFlowArtworkStyle === "aurral"
@@ -105,6 +109,7 @@ export const normalizeSettings = (savedSettings) => {
         discoveryAutoRefreshHours: normalizedAutoRefreshHours,
         discoveryRecommendationsPerRefresh: normalizedRecommendationsPerRefresh,
         discoveryPersonalizedEnabled: lastfm.discoveryPersonalizedEnabled === false ? false : true,
+        discoveryEditorialEnabled: lastfm.discoveryEditorialEnabled === false ? false : true,
         discoveryMode:
           lastfm.discoveryMode === "safer" || lastfm.discoveryMode === "deeper"
             ? lastfm.discoveryMode

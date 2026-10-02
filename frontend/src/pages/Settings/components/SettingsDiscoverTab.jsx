@@ -71,6 +71,11 @@ export function SettingsDiscoverTab({
         ? "ListenBrainz"
         : "Last.fm";
   const isListenBrainzFallback = health?.discovery?.provider === "listenbrainz-fallback";
+  // Undefined means "decide by provider": editorial shelves are cheap with a
+  // Last.fm key and slow via ListenBrainz tag lookups, so default them off
+  // for ListenBrainz-only setups while preserving Last.fm behavior.
+  const discoveryEditorialEnabled =
+    settings.integrations?.lastfm?.discoveryEditorialEnabled ?? health?.discovery?.provider === "lastfm";
   const showLastfmDiscoverBanner = isListenBrainzFallback && !lastfmBannerDismissed;
   const activeProgress = discoveryProgress ?? health?.discovery?.updateProgress;
   const showProgress = health?.discovery?.isUpdating || refreshingDiscovery;
@@ -218,6 +223,21 @@ export function SettingsDiscoverTab({
                     })
                   }
                   aria-label="Recommended playlists"
+                />
+              </SettingsArrFormGroup>
+              <SettingsArrFormGroup
+                label="Editorial playlists"
+                help="Curated genre, mood, and era shelves. Without a Last.fm key these resolve through ListenBrainz, which can add several minutes to a refresh."
+              >
+                <PillToggle
+                  className="settings-toggle"
+                  checked={discoveryEditorialEnabled}
+                  onChange={(e) =>
+                    updateLastfmDiscovery({
+                      discoveryEditorialEnabled: e.target.checked,
+                    })
+                  }
+                  aria-label="Editorial playlists"
                 />
               </SettingsArrFormGroup>
             </>
